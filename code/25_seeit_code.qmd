@@ -1,0 +1,211 @@
+---
+title: "SEEIT Framework"
+format: html
+---
+
+# packages
+
+```{r}
+library(tidyverse)
+library(measurements)
+library(tidymodels)
+library(ranger)
+library(vip)
+library(sf)
+library(terra)
+library(tidyterra)
+library(aqp)
+library(tmap)
+library(mapview)
+library(ggplot2)
+library(ggspatial)
+library(tigris)
+library(rstac)
+```
+
+# data wrangling
+
+## import paths
+
+```{r}
+ncss_path <- "../data/ncss_labdatagpkg/ncss_labdata.gpkg"
+
+mlra_path <- "../data/MLRA_52_2022/MLRA_52_2022/MLRA_52.shp"
+
+ssurgo_path <- "../data/ALL_SSURGO_10_01_2024/ALL_SSURGO_gpkg/ALL_SSURGO_10_01_2024.gpkg"
+
+dem_path <- "../data/topo_dem/dem_seamless.tif"
+
+topo_path <- "../data/topo_deriv/"
+```
+
+## table data
+
+```{r}
+st_layers(ncss_path)
+
+ncss_table_layer <- st_read(ncss_path,layer = "lab_layer")
+
+ncss_table_pedon <- st_read(ncss_path,layer = "lab_pedon")
+```
+
+## vector data
+
+### read
+
+```{r}
+conus_sf <- tigris::states(cb = TRUE) %>%
+  st_as_sf() %>%
+  filter(STUSPS %in% c("AL", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "ID", "IL", "IN", "IA", 
+  "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", 
+  "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", 
+  "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY")) %>%
+  st_union()
+
+states_sf <- tigris::states(cb = TRUE) %>%
+  st_as_sf() %>%
+  filter(STUSPS %in% c("AL", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "ID", "IL", "IN", "IA", 
+  "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", 
+  "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", 
+  "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"))
+
+
+county_sf <- tigris::counties(state = "GA", cb = TRUE) %>%
+  st_as_sf()
+
+mlra_sf <- st_read(mlra_path)
+
+ssurgo_sf <- st_read(ssurgo_path)
+
+ncss_sf <- st_read(ncss_path)
+
+```
+
+### project
+
+```{r}
+epsg_val <- 5070 # WGS84
+
+epsg_valt <- paste0("epsg:",epsg_val)
+
+conus_sfp <- conus_sf %>%
+  st_transform(crs = epsg_val)
+
+plot(st_geometry(conus_sfp))
+
+states_sfp <- states_sf %>%
+  st_transform(crs = epsg_val)
+
+county_sfp <- county_sf %>%
+  st_transform(crs = epsg_val)
+
+plot(st_geometry(county_sfp))
+
+mlra_sfp <- mlra_sf %>%
+  st_transform(crs = epsg_val)
+
+plot(st_geometry(mlra_sfp))
+
+ssurgo_sfp <- ssurgo_sf %>%
+  st_transform(crs = epsg_val)
+
+#plot(st_geometry(ssurgo_sfp))
+
+ncss_sfp <- ncss_sf %>%
+  st_transform(crs = epsg_val)
+
+plot(st_geometry(ncss_sfp))
+```
+
+### filter
+
+```{r}
+county_val <- "Clarke" #Athens-Clarke
+
+mlra_val <- c("136") #Piedmont
+
+county_sfpf <- county_sfp %>%
+  filter( NAME == county_val)
+
+plot(st_geometry(county_sfpf))
+
+mlra_sfpf <- mlra_sfp %>%
+  filter(MLRARSYM %in% mlra_val)
+
+plot(st_geometry(mlra_sfpf))
+```
+
+### save
+
+```{r}
+
+```
+
+## raster data
+
+### read
+
+```{r}
+topo_files <- list.files(topo_path, pattern = "*.tif",full.names = T)
+
+topo_spatrast <- rast(topo_files)
+
+dem_spatrast <- rast(dem_path)
+
+```
+
+### crop & mask
+
+```{r}
+topoc_spatrast <- topo_spatrast %>%
+  crop(mlra_sfpf %>%
+         st_transform(crs(topo_spatrast)),mask = T)
+
+plot(topoc_spatrast)
+
+topoc_spatrast_path <- paste0("../data/raster/",substitute(topoc_spatrast),".tif")
+
+writeRaster(topoc_spatrast,topoc_spatrast_path, overwrite = T)
+
+demc_spatrast <- dem_spatrast %>%
+  crop(mlra_sfpf %>%
+         st_transform(crs(dem_spatrast)),mask = T)
+
+plot(demc_spatrast)
+
+demc_spatrast_path <- paste0("../data/raster/",substitute(demc_spatrast),".tif")
+
+writeRaster(demc_spatrast,demc_spatrast_path, overwrite = T)
+```
+
+### project
+
+```{r}
+topocp_spatrast <- topoc_spatrast %>%
+  project(epsg_valt)
+
+topocp_spatrast_path <- paste0("../data/raster/",substitute(topocp_spatrast),".tif")
+
+writeRaster(topocp_spatrast,topocp_spatrast_path, overwrite = T)
+
+demcp_spatrast <- demc_spatrast %>%
+  project(epsg_valt)
+
+plot(demcp_spatrast)
+
+demcp_spatrast_path <- paste0("../data/raster/",substitute(demcp_spatrast),".tif")
+
+writeRaster(demcp_spatrast,demcp_spatrast_path, overwrite = T)
+```
+
+### concate covariates
+
+```{r}
+demcp_spatrast<- rast("../data/raster/demcp_spatrast.tif")
+
+demcp_ext<- ext(demcp_spatrast)
+
+topocp_spatrast<- rast("../data/raster/topocp_spatrast.tif")
+
+topocpe_spatrast <- mask(topocp_spatrast,demcp_ext)
+```
