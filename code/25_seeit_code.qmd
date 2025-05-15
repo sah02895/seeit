@@ -8,6 +8,7 @@ format: html
 ```{r}
 library(tidyverse)
 library(measurements)
+library(lubridate)
 library(tidymodels)
 library(ranger)
 library(vip)
@@ -21,6 +22,8 @@ library(ggplot2)
 library(ggspatial)
 library(tigris)
 library(rstac)
+library(FedData)
+library(aqp)
 ```
 
 # data wrangling
@@ -32,21 +35,39 @@ ncss_path <- "../data/ncss_labdatagpkg/ncss_labdata.gpkg"
 
 mlra_path <- "../data/MLRA_52_2022/MLRA_52_2022/MLRA_52.shp"
 
-ssurgo_path <- "../data/ALL_SSURGO_10_01_2024/ALL_SSURGO_gpkg/ALL_SSURGO_10_01_2024.gpkg"
+ssurgo_path <- "../data/ALL_SSURGO_10_01_2024/ALL_SSURGO_gpkg/muraster_30m.tif"
 
-dem_path <- "../data/topo_dem/dem_seamless.tif"
+ssurgotable_path <- "../data/ALL_SSURGO_10_01_2024/ALL_SSURGO_gpkg/ALL_SSURGO_10_01_2024.gpkg"
+
+dem_path <- "../data/dem/"
 
 topo_path <- "../data/topo_deriv/"
+
+mat_path <- "../data/prism/PRISM_ppt_30yr_normal_4kmM4_annual_asc.asc"
+
+map_path <- "../data/prism/PRISM_tmean_30yr_normal_4kmM5_annual_asc.asc"
+
+nlcd_path <- "../data/nlcd/"
 ```
 
-## table data
+## tabular data
+
+### read
 
 ```{r}
 st_layers(ncss_path)
 
 ncss_table_layer <- st_read(ncss_path,layer = "lab_layer")
 
-ncss_table_pedon <- st_read(ncss_path,layer = "lab_pedon")
+st_layers(ssurgotable_path)
+
+mukey_table <- st_read(ssurgotable_path,layer = "mapunit", fid_column_name = "mukey")
+
+muaggatt_table <- st_read(ssurgotable_path,layer = "muaggatt", fid_column_name = "mukey")
+
+component_table <- st_read(ssurgotable_path,layer = "component", fid_column_name = "cokey")
+
+chorizon_table <- st_read(ssurgotable_path,layer = "chorizon")
 ```
 
 ## vector data
@@ -70,12 +91,10 @@ states_sf <- tigris::states(cb = TRUE) %>%
   "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY"))
 
 
-county_sf <- tigris::counties(state = "GA", cb = TRUE) %>%
-  st_as_sf()
+#county_sf <- tigris::counties(state = "GA", cb = TRUE) %>%
+#  st_as_sf()
 
 mlra_sf <- st_read(mlra_path)
-
-ssurgo_sf <- st_read(ssurgo_path)
 
 ncss_sf <- st_read(ncss_path)
 
@@ -96,20 +115,15 @@ plot(st_geometry(conus_sfp))
 states_sfp <- states_sf %>%
   st_transform(crs = epsg_val)
 
-county_sfp <- county_sf %>%
-  st_transform(crs = epsg_val)
+#county_sfp <- county_sf %>%
+#  st_transform(crs = epsg_val)
 
-plot(st_geometry(county_sfp))
+#plot(st_geometry(county_sfp))
 
 mlra_sfp <- mlra_sf %>%
   st_transform(crs = epsg_val)
 
 plot(st_geometry(mlra_sfp))
-
-ssurgo_sfp <- ssurgo_sf %>%
-  st_transform(crs = epsg_val)
-
-#plot(st_geometry(ssurgo_sfp))
 
 ncss_sfp <- ncss_sf %>%
   st_transform(crs = epsg_val)
@@ -120,25 +134,35 @@ plot(st_geometry(ncss_sfp))
 ### filter
 
 ```{r}
-county_val <- "Clarke" #Athens-Clarke
+#county_val <- "Clarke" #Athens-Clarke
 
-mlra_val <- c("136") #Piedmont
+mlra_val <- c("133A") #Coastal Plain
 
-county_sfpf <- county_sfp %>%
-  filter( NAME == county_val)
+#county_sfpf <- county_sfp %>%
+#  filter( NAME == county_val)
 
-plot(st_geometry(county_sfpf))
+#plot(st_geometry(county_sfpf))
 
 mlra_sfpf <- mlra_sfp %>%
   filter(MLRARSYM %in% mlra_val)
 
 plot(st_geometry(mlra_sfpf))
+
+ncss_sfpf <- ncss_sfp %>%
+  st_intersection(mlra_sfpf) %>%
+  mutate(samp_year = year(ymd_hms(samp_classdate))) %>%
+  mutate(samp_yearold = samp_year-10) %>%
+  filter(samp_year > 1995)
+
+plot(st_geometry(ncss_sfpf))
 ```
 
 ### save
 
 ```{r}
+mlra_sfpf_path <- paste0("../data/vector/",substitute(mlra_sfpf),".shp")
 
+write_sf(mlra_sfpf,mlra_sfpf_path)
 ```
 
 ## raster data
@@ -146,26 +170,56 @@ plot(st_geometry(mlra_sfpf))
 ### read
 
 ```{r}
-topo_files <- list.files(topo_path, pattern = "*.tif",full.names = T)
+ssurgo_spatrast <- rast(ssurgo_path)
+
+topo_files <- list.files(topo_path, pattern = "*.tif$",full.names = T)
 
 topo_spatrast <- rast(topo_files)
 
-dem_spatrast <- rast(dem_path)
+dem_files <- list.files(dem_path, pattern = "*.tif$",full.names = T)
 
+dem_sprc <- lapply(dem_files, rast) %>%
+  sprc()
+
+map_spatrast <- rast(map_path)
+
+mat_spatrast <- rast(mat_path)
+
+nlcd_files <- list.files(nlcd_path, pattern = "*.tif$",full.names = T)
+
+nlcd_spatrast <- rast(nlcd_files)
+```
+
+### mosaic
+
+```{r}
+dem_spatrast <- mosaic(dem_sprc, fun = mean)
+
+writeRaster(dem_spatrast,"../data/raster/dem_spatrast.tif", overwrite = T)
+
+plot(dem_spatrast)
 ```
 
 ### crop & mask
 
 ```{r}
-topoc_spatrast <- topo_spatrast %>%
+# topoc_spatrast <- topo_spatrast %>%
+#   crop(mlra_sfpf %>%
+#          st_transform(crs(topo_spatrast)),mask = T)
+# 
+# plot(topoc_spatrast)
+# 
+# topoc_spatrast_path <- paste0("../data/raster/",substitute(topoc_spatrast),".tif")
+# 
+# writeRaster(topoc_spatrast,topoc_spatrast_path, overwrite = T)
+
+ssurgoc_spatrast <- ssurgo_spatrast %>%
   crop(mlra_sfpf %>%
-         st_transform(crs(topo_spatrast)),mask = T)
+         st_transform(crs(ssurgo_spatrast)),mask = T)
 
-plot(topoc_spatrast)
+ssurgoc_spatrast_path <- paste0("../data/raster/",substitute(ssurgoc_spatrast),".tif")
 
-topoc_spatrast_path <- paste0("../data/raster/",substitute(topoc_spatrast),".tif")
-
-writeRaster(topoc_spatrast,topoc_spatrast_path, overwrite = T)
+writeRaster(ssurgoc_spatrast,ssurgoc_spatrast_path, overwrite = T)
 
 demc_spatrast <- dem_spatrast %>%
   crop(mlra_sfpf %>%
@@ -176,17 +230,74 @@ plot(demc_spatrast)
 demc_spatrast_path <- paste0("../data/raster/",substitute(demc_spatrast),".tif")
 
 writeRaster(demc_spatrast,demc_spatrast_path, overwrite = T)
+
+mapc_spatrast <- map_spatrast %>%
+  crop(mlra_sfpf %>%
+         st_transform(crs(map_spatrast)),mask = T)
+
+mapc_spatrast_path <- paste0("../data/raster/",substitute(mapc_spatrast),".tif")
+
+writeRaster(mapc_spatrast,mapc_spatrast_path, overwrite = T)
+
+matc_spatrast <- mat_spatrast %>%
+  crop(mlra_sfpf %>%
+         st_transform(crs(mat_spatrast)),mask = T)
+
+matc_spatrast_path <- paste0("../data/raster/",substitute(matc_spatrast),".tif")
+
+writeRaster(matc_spatrast,matc_spatrast_path, overwrite = T)
+
+nlcdc_spatrast <- nlcd_spatrast %>%
+  crop(mlra_sfpf %>%
+         st_transform(crs(nlcd_spatrast)),mask = T)
+
+nlcdc_spatrast_path <- paste0("../data/raster/",substitute(nlcdc_spatrast),".tif")
+
+writeRaster(nlcdc_spatrast,nlcdc_spatrast_path, overwrite = T)
+```
+
+### read crop
+
+```{r}
+ssurgoc_spatrast <- rast("../data/raster/ssurgoc_spatrast.tif")
+
+demc_spatrast <- rast("../data/raster/demc_spatrast.tif")
+
+mapc_spatrast <- rast("../data/raster/mapc_spatrast.tif")
+
+matc_spatrast <- rast("../data/raster/matc_spatrast.tif")
+
+nlcdc_spatrast <- rast("../data/raster/nlcdc_spatrast.tif")
 ```
 
 ### project
 
 ```{r}
-topocp_spatrast <- topoc_spatrast %>%
-  project(epsg_valt)
+# topocp_spatrast <- topoc_spatrast %>%
+#   project(epsg_valt)
+# 
+# topocp_spatrast_path <- paste0("../data/raster/",substitute(topocp_spatrast),".tif")
+# 
+# writeRaster(topocp_spatrast,topocp_spatrast_path, overwrite = T)
 
-topocp_spatrast_path <- paste0("../data/raster/",substitute(topocp_spatrast),".tif")
+ssurgo_spatrastcp <- ssurgo_spatrastc %>%
+  project(epsg_valt, method = "near")
 
-writeRaster(topocp_spatrast,topocp_spatrast_path, overwrite = T)
+ssurgo_levelscp <- levels(ssurgo_spatrastcp)[[1]]
+
+class(ssurgo_levelscp$MUKEY)
+
+ssurgo_valuescp <- ssurgo_spatrastcp %>%
+  unique()
+
+ssurgo_levelscp_new <- ssurgo_levelscp %>%
+  filter(MUKEY %in% ssurgo_valuescp$MUKEY)
+
+levels(ssurgo_spatrastcp) <- list(ssurgo_levelscp_new)
+
+ssurgo_spatrastcp_path <- paste0("../data/raster/",substitute(ssurgo_spatrastcp),".tif")
+
+writeRaster(ssurgo_spatrastcp,ssurgo_spatrastcp_path, overwrite = T)
 
 demcp_spatrast <- demc_spatrast %>%
   project(epsg_valt)
@@ -196,16 +307,347 @@ plot(demcp_spatrast)
 demcp_spatrast_path <- paste0("../data/raster/",substitute(demcp_spatrast),".tif")
 
 writeRaster(demcp_spatrast,demcp_spatrast_path, overwrite = T)
+
+mapcp_spatrast <- mapc_spatrast %>%
+  project(epsg_valt)
+
+mapcp_spatrast_path <- paste0("../data/raster/",substitute(mapcp_spatrast),".tif")
+
+writeRaster(mapcp_spatrast,mapcp_spatrast_path, overwrite = T)
+
+matcp_spatrast <- matc_spatrast %>%
+  project(epsg_valt)
+
+matcp_spatrast_path <- paste0("../data/raster/",substitute(matcp_spatrast),".tif")
+
+writeRaster(matcp_spatrast,matcp_spatrast_path, overwrite = T)
+
+nlcdcp_spatrast <- nlcdc_spatrast %>%
+  project(epsg_valt, method = "near")
+
+nlcdcp_spatrast_path <- paste0("../data/raster/",substitute(nlcdcp_spatrast),".tif")
+
+writeRaster(nlcdcp_spatrast,nlcdcp_spatrast_path, overwrite = T)
 ```
 
-### concate covariates
+### read project
 
 ```{r}
-demcp_spatrast<- rast("../data/raster/demcp_spatrast.tif")
+ssurgo_spatrastcp <- rast("../data/raster/ssurgo_spatrastcp.tif")
 
-demcp_ext<- ext(demcp_spatrast)
+demcp_spatrast <- rast("../data/raster/demcp_spatrast.tif")
 
-topocp_spatrast<- rast("../data/raster/topocp_spatrast.tif")
+mapcp_spatrast <- rast("../data/raster/mapcp_spatrast.tif")
 
-topocpe_spatrast <- mask(topocp_spatrast,demcp_ext)
+matcp_spatrast <- rast("../data/raster/matcp_spatrast.tif")
+
+nlcdcp_spatrast <- rast("../data/raster/nlcdcp_spatrast.tif")
+```
+
+# feature engineering
+
+### slope and aspect
+
+```{r}
+slopeaspect_spatrast<-terrain(demcp_spatrast, v = c("slope","aspect"), unit = "degrees", neighbors = 8)
+
+slopeaspect_spatrast$southwestness<-cos(slopeaspect_spatrast$aspect-225)
+
+writeRaster(slopeaspect_spatrast,"../data/raster/slopeaspect_spatrast.tif", overwrite = T)
+
+ncss_sfpf$slope<-extract(slopeaspect_spatrast$slope, ncss_sfpf)
+
+ncss_sfpf$aspect<-extract(slopeaspect_spatrast$aspect, ncss_sfpf)
+```
+
+### landcover change
+
+```{r}
+ncss_sfpf$samp_nlcdyear <- paste0("nlcd_", ncss_sfpf$samp_year)
+ncss_sfpf$samp_nlcdyearold <- paste0("nlcd_", ncss_sfpf$samp_yearold)
+
+ncss_sfpf$landcover <- sapply(1:nrow(ncss_sfpf), function(i) {
+  samp_year <- ncss_sfpf$samp_nlcdyear[i]
+  extract(nlcdcp_spatrast[[samp_year]], ncss_sfpf[i, , drop = FALSE])[[2]]
+})
+
+ncss_sfpf$landcover_old <- sapply(1:nrow(ncss_sfpf), function(i) {
+  samp_year <- ncss_sfpf$samp_nlcdyearold[i]
+  extract(nlcdcp_spatrast[[samp_year]], ncss_sfpf[i, , drop = FALSE])[[2]]
+})
+```
+
+### soil taxonomy and properties (order, suborder, great group, subgroup, pH, erosional phase, drainage class, particle size, HSG)
+
+```{r}
+
+ssurgo_valuescp <- ssurgo_spatrastcp %>%
+  unique()
+
+muaggatt_tablef <- muaggatt_table %>%
+  filter(mukey %in% ssurgo_valuescp$MUKEY)
+
+component_tablef <- component_table %>%
+  filter(mukey %in% ssurgo_valuescp$MUKEY) %>%
+  group_by(mukey) %>%
+  filter(comppct_r == max(comppct_r)) %>%
+  ungroup() %>%
+  select(compname,cokey,mukey,erocl,hydgrp,drainagecl,taxpartsize,taxorder,taxsuborder,taxgrtgroup,taxsubgrp,hydgrp)
+
+component_tablef$taxorder %>%
+  unique() %>%
+  sort()
+
+component_tablef$taxsuborder %>%
+  unique() %>%
+  sort()
+
+component_tablef_mod<-component_tablef %>%
+  mutate(taxsuborder_mod = case_when(
+    str_detect(taxsuborder, "Aqu") ~ "Aqu",
+    str_detect(taxsuborder, "(Ud|Hum|Ren|Um|Orth|Och|Ar)") ~ "Ud",
+    str_detect(taxsuborder, "Flu") ~ "Flu",
+    str_detect(taxsuborder, "(Sap|Hemi)") ~ "Sap",
+    str_detect(taxsuborder, "Psa") ~ "Psa"
+  ))
+  
+component_tablef$taxgrtgroup %>%
+  unique() %>%
+  sort()
+
+component_tablef_mod <- component_tablef_mod %>%
+  mutate(taxgrtgroup_mod = case_when(
+    str_detect(taxgrtgroup, "Alaquods") ~ "Alaqu",
+    str_detect(taxgrtgroup, "Albaqualfs|Albaquults") ~ "Albaq",
+    str_detect(taxgrtgroup, "Alorthods") ~ "Hap",
+    str_detect(taxgrtgroup, "Dystrochrepts|Dystrudepts|Dystruderts") ~ "Dystr",
+    str_detect(taxgrtgroup, "Endoaqualfs|Endoaquepts|Endoaquods|Endoaquults") ~ "Endoa",
+    str_detect(taxgrtgroup, "Eutrochrepts") ~ "Dystr",
+    str_detect(taxgrtgroup, "Fluvaquents") ~ "Fluva",
+    str_detect(taxgrtgroup, "Fragiaquults|Fragiudults") ~ "Fragi",
+    str_detect(taxgrtgroup, "Haplaquepts|Haplaquods|Haplohemists|Haplohumods|Haplosaprists|Hapludalfs|Hapluderts|Hapludults|Haprendolls") ~ "Hap",
+    str_detect(taxgrtgroup, "Humaquepts") ~ "Humaq",
+    str_detect(taxgrtgroup, "Hydraquents") ~ "Humaq",
+    str_detect(taxgrtgroup, "Kandiudults|Kanhapludalfs|Kanhapludults") ~ "Kan",
+    str_detect(taxgrtgroup, "Medihemists") ~ "Hap",
+    str_detect(taxgrtgroup, "Medisaprists") ~ "Hap",
+    str_detect(taxgrtgroup, "Ochraqualfs|Ochraquults") ~ "Hap",
+    str_detect(taxgrtgroup, "Paleaquults|Paleudalfs|Paleudults") ~ "Pal",
+    str_detect(taxgrtgroup, "Psammaquents|Quartzipsamments") ~ "Psamm",
+    str_detect(taxgrtgroup, "Rendolls") ~ "Hap",
+    str_detect(taxgrtgroup, "Sulfaquents") ~ "Hap",
+    str_detect(taxgrtgroup, "Sulfihemists|Sulfisaprists") ~ "Hap",
+    str_detect(taxgrtgroup, "Udifluvents") ~ "Fluva",
+    str_detect(taxgrtgroup, "Udipsamments") ~ "Psamm",
+    str_detect(taxgrtgroup, "Udorthents") ~ "Hap",
+    str_detect(taxgrtgroup, "Umbraquults") ~ "Umbra"
+  ))
+
+component_tablef$taxsubgrp %>%
+  unique() %>%
+  sort()
+
+component_tablef_mod <- component_tablef_mod %>%
+  mutate(taxsubgrp_mod = case_when(
+    str_detect(taxsubgrp, "Aeric Alaquods|Aeric Albaqualfs|Aeric Endoaqualfs|Aeric Endoaquepts|Aeric Endoaquults|Aeric Fluvaquents|Aeric Haplaquepts|Aeric Ochraqualfs|Aeric Ochraquults|Aeric Paleaquults") ~ "Aeric",
+    str_detect(taxsubgrp, "Albaquic Hapludalfs") ~ "Albaquic",
+    str_detect(taxsubgrp, "Alfic Alaquods") ~ "Alfic",
+    str_detect(taxsubgrp, "Aquic Arenic Hapludalfs|Aquic Arenic Hapludults|Aquic Arenic Paleudults|Aquic Fragiudults|Aquic Hapludalfs|Aquic Hapludults|Aquic Kanhapludults|Aquic Paleudalfs|Aquic Paleudults|Aquic Quartzipsamments|Aquic Udifluvents|Aquic Udipsamments") ~ "Aquic",
+    str_detect(taxsubgrp, "Aquultic Hapludalfs") ~ "Aquultic",
+    str_detect(taxsubgrp, "Arenic Albaqualfs|Arenic Endoaqualfs|Arenic Endoaquults|Arenic Hapludalfs|Arenic Hapludults|Arenic Kandiudults|Arenic Kanhapludults|Arenic Paleaquults|Arenic Paleudults|Arenic Plinthaquic Paleudults|Arenic Plinthic Kandiudults|Arenic Plinthic Paleaquults|Arenic Plinthic Paleudults|Arenic Umbric Paleaquults") ~ "Arenic",
+    str_detect(taxsubgrp, "Chromic Dystruderts|Chromic Hapluderts") ~ "Chromic",
+    str_detect(taxsubgrp, "Cumulic Humaquepts") ~ "Cumulic",
+    str_detect(taxsubgrp, "Entic Grossarenic Alorthods|Entic Haplohumods") ~ "Entic",
+    str_detect(taxsubgrp, "Fluvaquentic Dystrochrepts|Fluvaquentic Dystrudepts|Fluvaquentic Endoaquepts") ~ "Fluvaquentic",
+    str_detect(taxsubgrp, "Fluventic Dystrochrepts|Fluventic Dystrudepts") ~ "Fluventic",
+    str_detect(taxsubgrp, "Fragiaquic Kanhapludults|Fragiaquic Paleudults") ~ "Fragiaquic",
+    str_detect(taxsubgrp, "Fragic Kanhapludults") ~ "Fragic",
+    str_detect(taxsubgrp, "Grossarenic Alaquods|Grossarenic Entic Alorthods|Grossarenic Entic Haplohumods|Grossarenic Kandiudults|Grossarenic Paleaquults|Grossarenic Paleudalfs|Grossarenic Paleudults|Grossarenic Plinthic Paleudults") ~ "Grossarenic",
+    str_detect(taxsubgrp, "Histic Humaquepts") ~ "Histic",
+    str_detect(taxsubgrp, "Humaqueptic Psammaquents") ~ "Humaqueptic",
+    str_detect(taxsubgrp, "Humic Hapludults|Humic Pachic Dystrudepts") ~ "Humic",
+    str_detect(taxsubgrp, "Inceptic Hapludults") ~ "Inceptic",
+    str_detect(taxsubgrp, "Lamellic Quartzipsamments") ~ "Lamellic",
+    str_detect(taxsubgrp, "Mollic Albaqualfs|Mollic Hapludalfs") ~ "Mollic",
+    str_detect(taxsubgrp, "Oxyaquic Alorthods|Oxyaquic Dystrudepts|Oxyaquic Hapludults|Oxyaquic Paleudults|Oxyaquic Udifluvents|Oxyaquic Vertic Hapludalfs") ~ "Oxyaquic",
+    str_detect(taxsubgrp, "Plinthaquic Paleudults") ~ "Plinthaquic",
+    str_detect(taxsubgrp, "Plinthic Fragiudults|Plinthic Kandiudults|Plinthic Paleaquults|Plinthic Paleudults") ~ "Plinthic",
+    str_detect(taxsubgrp, "Psammentic Hapludults|Psammentic Paleudults") ~ "Psammentic",
+    str_detect(taxsubgrp, "Rendollic Eutrochrepts") ~ "Rendollic",
+    str_detect(taxsubgrp, "Rhodic Kandiudults|Rhodic Paleudults") ~ "Rhodic",
+    str_detect(taxsubgrp, "Ruptic-Ultic Dystrudepts") ~ "Ruptic-Ultic",
+    str_detect(taxsubgrp, "Spodic Paleudults|Spodic Psammaquents|Spodic Quartzipsamments") ~ "Spodic",
+    str_detect(taxsubgrp, "Terric Haplosaprists|Terric Medisaprists|Terric Sulfihemists|Terric Sulfisaprists") ~ "Terric",
+    str_detect(taxsubgrp, "Typic Alaquods|Typic Albaqualfs|Typic Albaquults|Typic Dystrochrepts|Typic Dystrudepts|Typic Endoaqualfs|Typic Endoaquepts|Typic Endoaquults|Typic Fluvaquents|Typic Fragiaquults|Typic Fragiudults|Typic Haplaquods|Typic Haplohemists|Typic Haplosaprists|Typic Hapludalfs|Typic Hapludults|Typic Haprendolls|Typic Humaquepts|Typic Hydraquents|Typic Kandiudults|Typic Kanhapludalfs|Typic Kanhapludults|Typic Medihemists|Typic Medisaprists|Typic Ochraquults|Typic Paleaquults|Typic Paleudults|Typic Psammaquents|Typic Quartzipsamments|Typic Rendolls|Typic Sulfaquents|Typic Sulfihemists|Typic Udifluvents|Typic Udipsamments|Typic Udorthents|Typic Umbraquults") ~ "Typic",
+    str_detect(taxsubgrp, "Ultic Alaquods|Ultic Haplaquods|Ultic Haplohumods|Ultic Hapludalfs") ~ "Ultic",
+    str_detect(taxsubgrp, "Umbric Endoaqualfs|Umbric Endoaquods|Umbric Paleaquults") ~ "Umbric",
+    str_detect(taxsubgrp, "Vertic Hapludalfs|Vertic Paleudalfs") ~ "Vertic"
+  ))
+
+component_tablef_mod<-component_tablef_mod %>%
+  mutate(mukey= as.numeric(mukey))
+
+chorizon_tablef <-chorizon_table %>%
+  filter(cokey %in% component_tablef$cokey) %>%
+  arrange(cokey)
+
+depths(chorizon_tablef) <- cokey ~ hzdept_r + hzdepb_r
+
+pH_tablef <- chorizon_tablef %>%
+  slab(cokey ~ ph1to1h2o_r, SPC = FALSE, slab.structure = c(0,20), slab.fun = mean, na.rm = TRUE) %>%
+  mutate(cokey = as.factor(cokey))
+
+component_tablef_pH <- component_tablef %>%
+  left_join(pH_tablef, by = "cokey") %>%
+  select(compname,cokey,mukey,erocl,hydgrp,taxorder,taxsuborder,taxgrtgroup,taxsubgrp,hydgrp,value) %>%
+  rename(ph1to1h2o_r = value)
+
+order_table <- component_tablef_mod %>%
+  select(mukey,taxorder) %>%
+  mutate(taxorder = as.numeric(as.factor(taxorder)))
+
+order_label <- component_tablef_mod %>%
+  select(taxorder) %>%
+  mutate(taxorder_num = as.numeric(as.factor(taxorder))) %>%
+  distinct() %>%
+  select(taxorder_num,taxorder) %>%
+  arrange(taxorder_num) %>%
+  drop_na()
+
+order_spatrast<-classify(ssurgo_spatrastcp, order_table)
+  
+names(order_spatrast) <- "taxorder"
+
+levels(order_spatrast) <- order_label
+
+order_spatrast_path <- paste0("../data/raster/",substitute(order_spatrast),".tif")
+
+writeRaster(order_spatrast,order_spatrast_path, overwrite = T)
+  
+suborder_table <- component_tablef_mod %>%
+  select(mukey,taxsuborder_mod) %>%
+  mutate(taxsuborder_mod = as.numeric(as.factor(taxsuborder_mod)))
+
+suborder_label <- component_tablef_mod %>%
+  select(taxsuborder_mod) %>%
+  mutate(taxsuborder_mod_num = as.numeric(as.factor(taxsuborder_mod))) %>%
+  distinct() %>%
+  select(taxsuborder_mod_num,taxsuborder_mod) %>%
+  arrange(taxsuborder_mod_num) %>%
+  drop_na()
+
+suborder_spatrast<-classify(ssurgo_spatrastcp, suborder_table)
+
+names(suborder_spatrast) <- "taxsuborder_mod"
+
+levels(suborder_spatrast) <- suborder_label
+
+suborder_spatrast_path <- paste0("../data/raster/",substitute(suborder_spatrast),".tif")
+
+writeRaster(suborder_spatrast,suborder_spatrast_path, overwrite = T)
+
+greatgroup_table <- component_tablef_mod %>%
+  select(mukey,taxgrtgroup_mod) %>%
+  mutate(taxgrtgroup_mod = as.numeric(as.factor(taxgrtgroup_mod)))
+
+greatgroup_spatrast<-classify(ssurgo_spatrastcp, greatgroup_table)
+
+greatgroup_spatrast_path <- paste0("../data/raster/",substitute(greatgroup_spatrast),".tif")
+
+writeRaster(greatgroup_spatrast,greatgroup_spatrast_path, overwrite = T)
+
+greatgroup_spatrast<-rast("../data/raster/greatgroup_spatrast.tif")
+
+names(greatgroup_spatrast) <- "taxgrtgroup_mod"
+
+subgroup_table <- component_tablef_mod %>%
+  select(mukey,taxsubgrp_mod) %>%
+  mutate(taxsubgrp_mod = as.numeric(as.factor(taxsubgrp_mod)))
+
+subgroup_spatrast<-classify(ssurgo_spatrastcp, subgroup_table)
+
+subgroup_spatrast_path <- paste0("../data/raster/",substitute(subgroup_spatrast),".tif")
+
+writeRaster(subgroup_spatrast,subgroup_spatrast_path, overwrite = T)
+
+subgroup_spatrast<-rast("../data/raster/subgroup_spatrast.tif")
+
+names(subgroup_spatrast) <- "taxsubgrp_mod"
+
+pH_table <- component_tablef_pH %>%
+  select(mukey,ph1to1h2o_r)
+
+pH_spatrast<-classify(ssurgo_spatrastcp, pH_table)
+
+pH_spatrast_path <- paste0("../data/raster/",substitute(pH_spatrast),".tif")
+
+writeRaster(pH_spatrast,pH_spatrast_path, overwrite = T)
+
+pH_spatrast<-rast("../data/raster/pH_spatrast.tif")
+
+names(pH_spatrast) <- "ph1to1h2o_r"
+
+erocl_table <- component_tablef_mod %>%
+  select(mukey,erocl) %>%
+  mutate(erocl = as.numeric(as.factor(erocl)))
+
+erocl_spatrast<-classify(ssurgo_spatrastcp, erocl_table)
+
+erocl_spatrast_path <- paste0("../data/raster/",substitute(erocl_spatrast),".tif")
+
+writeRaster(erocl_spatrast,erocl_spatrast_path, overwrite = T)
+
+erocl_spatrast<-rast("../data/raster/erocl_spatrast.tif")
+
+names(erocl_spatrast) <- "erocl"
+
+hydgrp_table <- component_tablef_mod %>%
+  select(mukey,hydgrp) %>%
+  mutate(hydgrp = as.numeric(as.factor(hydgrp)))
+
+hydgrp_spatrast<-classify(ssurgo_spatrastcp, hydgrp_table)
+
+hydgrp_spatrast_path <- paste0("../data/raster/",substitute(hydgrp_spatrast),".tif")
+
+writeRaster(hydgrp_spatrast,hydgrp_spatrast_path, overwrite = T)
+
+hydgrp_spatrast<-rast("../data/raster/hydgrp_spatrast.tif")
+
+names(hydgrp_spatrast) <- "hydgrp"
+
+drainagecl_table <- component_tablef_mod %>%
+  select(mukey,drainagecl) %>%
+  mutate(drainagecl = as.numeric(as.factor(drainagecl)))
+
+drainagecl_spatrast<-classify(ssurgo_spatrastcp, drainagecl_table)
+
+drainagecl_spatrast_path <- paste0("../data/raster/",substitute(drainagecl_spatrast),".tif")
+
+writeRaster(drainagecl_spatrast,drainagecl_spatrast_path, overwrite = T)
+
+drainagecl_spatrast<-rast("../data/raster/drainagecl_spatrast.tif")
+
+names(drainagecl_spatrast) <- "drainagecl"
+
+taxpartsize_table <- component_tablef_mod %>%
+  select(mukey,taxpartsize) %>%
+  mutate(taxpartsize = as.numeric(as.factor(taxpartsize)))
+
+taxpartsize_spatrast<-classify(ssurgo_spatrastcp, taxpartsize_table)
+
+taxpartsize_spatrast_path <- paste0("../data/raster/",substitute(taxpartsize_spatrast),".tif")
+
+writeRaster(taxpartsize_spatrast,taxpartsize_spatrast_path, overwrite = T)
+
+taxpartsize_spatrast<-rast("../data/raster/taxpartsize_spatrast.tif")
+
+names(taxpartsize_spatrast) <- "taxpartsize"
+
+soiltaxprop_spatrast<-c(order_spatrast,suborder_spatrast, greatgroup_spatrast, subgroup_spatrast, pH_spatrast, erocl_spatrast, hydgrp_spatrast, drainagecl_spatrast, taxpartsize_spatrast)
+
+soiltaxprop_spatrast_path <- paste0("../data/raster/",substitute(soiltaxprop_spatrast),".tif")
+
+writeRaster(soiltaxprop_spatrast,soiltaxprop_spatrast_path, overwrite = T)
+
+
 ```
