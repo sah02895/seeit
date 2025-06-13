@@ -1,0 +1,393 @@
+---
+title: "n-dimensional feature space exploration"
+format: html
+editor: visual
+---
+
+# Load packages
+
+```{r}
+library(ggplot2)
+library(plotly)
+library(tidyverse)
+library(cluster)
+library(ks)
+library(np)
+library(gower)
+library(rgl)
+library(sf)
+library(terra)
+```
+
+# Continuous Data
+
+## Create simulated feature space of only continuous variables
+
+```{r}
+# Create table representing 300 points in a 3D feature space and sample it
+set.seed(123)
+n <- 100
+x_cluster <- runif(3,0,1)
+x1 <- rnorm(n, mean = x_cluster[1], sd = 0.8)
+x2 <- rnorm(n, mean = x_cluster[2], sd = 1)
+x3 <- rnorm(n, mean = x_cluster[3], sd = 1.1)
+y_cluster <- runif(3,0,1)
+y1 <- rnorm(n, mean = y_cluster[1], sd = 0.8)
+y2 <- rnorm(n, mean = y_cluster[2], sd = 1)
+y3 <- rnorm(n, mean = y_cluster[3], sd = 1.1)
+z_cluster <- runif(3,0,1)
+z1 <- rnorm(n, mean = z_cluster[1], sd = 0.8)
+z2 <- rnorm(n, mean = z_cluster[2], sd = 1)
+z3 <- rnorm(n, mean = z_cluster[3], sd = 1.1)
+df <- data.frame(x = c(x1,x2,x3),
+                 y = c(y1,y2,y3),
+                 z = c(z1,z2,z3))
+
+df_sampled <- df %>%
+  filter(x < quantile(x, 0.75) | x > quantile(x, 1)) %>%
+  filter(y < quantile(y, 0.75) | y > quantile(y, 1)) %>%
+  filter(z < quantile(z, 0.25) | z > quantile(z, 0.75))
+
+# Create a 3D scatter plot of feature space
+plot_ly(df,
+        x = ~x, 
+        y = ~y, 
+        z = ~z, 
+        type = "scatter3d", 
+        mode = "markers",
+        marker = list(size = 2, color = "blue"),
+        name = "Simulated Feature Space"
+      ) %>%
+  add_trace(data = df_sampled,
+            x = ~x, 
+            y = ~y, 
+            z = ~z, 
+            type = "scatter3d", 
+            mode = "markers",
+            marker = list(size = 2, color = "red"),
+            name = "Sampled Feature Space"
+  ) %>%
+  layout(title = "3D Scatter Plot: Simulated vs Sampled Feature Space",
+         scene = list(xaxis = list(title = "X Axis"),
+                      yaxis = list(title = "Y Axis"),
+                      zaxis = list(title = "Z Axis")),
+         legend = list(title = list(text = "Legend"))
+  )
+
+```
+
+## Create a multivariate kernel density estimate and plot
+
+```{r}
+#Create a multivariate kernel density estimate using ks
+mv_kde <- kde(x = df_sampled,, compute.cont=TRUE)
+
+
+
+plot(mv_kde, 
+     main = "Multivariate Kernel Density Estimate",
+     xlab = "X", 
+     ylab = "Y", 
+     zlab = "Z", 
+     col = "lightblue", 
+     border = "black")
+
+xg <- mv_kde$eval.points[[1]]
+yg <- mv_kde$eval.points[[2]]
+zg <- mv_kde$eval.points[[3]]
+dens <- mv_kde$estimate
+
+level <- quantile(mv_kde$estimate, 0.1)  # e.g., 25th percentile
+
+# Plot 3D contour
+misc3d::contour3d(
+  mv_kde$estimate,
+  level = 0,
+  x = mv_kde$eval.points[[1]],
+  y = mv_kde$eval.points[[2]],
+  z = mv_kde$eval.points[[3]],
+  color = "skyblue",
+  alpha = 0.5,
+  fill = TRUE
+)
+```
+
+## Calculate gower distance between potential and sampled data
+
+```{r}
+# Calculate mean Gower distance between potential and sampled data
+df_all <- rbind(
+  data.frame(group = "potential", df),
+  data.frame(group = "sampled", df_sampled)
+)
+
+gower_dist <- daisy(df_all[, -1], metric = "gower")
+
+gower_matrix <- as.matrix(gower_dist)
+
+potential_idx <- which(df_all$group == "potential")
+sampled_idx <- which(df_all$group == "sampled")
+
+gower_potential_to_sampled <- gower_matrix[potential_idx, sampled_idx]
+
+gower_potential_to_potential <- gower_matrix[potential_idx, potential_idx]
+
+gower_sampled_to_sampled <- gower_matrix[sampled_idx, sampled_idx]
+
+gower_unimean<-mean(gower_potential_to_potential)
+
+gower_mean<-rowMeans(gower_potential_to_sampled)
+
+gower_min<-apply(gower_potential_to_sampled, 1, min)
+
+gower_sd<-apply(gower_potential_to_sampled, 1, sd)
+
+df<-df %>%
+  mutate(distance_gower_mean = gower_mean) %>%
+  mutate(distance_gower_std = distance_gower_mean/ gower_unimean) %>%
+  mutate(distance_gower_min = gower_min) %>%
+  mutate(distance_gower_min_std = distance_gower_min / gower_unimean)
+
+hist(gower_sd, 
+     main = "Histogram of Gower Distances",
+     xlab = "Gower Distance",
+     col = "lightblue", 
+     border = "black")
+  
+
+# plot 3d feature space and color points by mean gower distance
+
+plot_ly(df,
+        x = ~x, 
+        y = ~y, 
+        z = ~z, 
+        color = ~distance_gower_min_std,
+        colors = colorRamp(c("blue", "red")),
+        type = "scatter3d", 
+        mode = "markers",
+        marker = list(size = 2)) %>%
+  layout(title = "3D Scatter Plot of Simulated Feature Space with Gower Distance",
+         scene = list(xaxis = list(title = "X Axis"),
+                      yaxis = list(title = "Y Axis"),
+                      zaxis = list(title = "Z Axis")))
+
+```
+
+# Mixed Data
+
+## Create a simulated feature space of both continuous and categorical variables
+
+```{r}
+# Create a table representing 300 points in a 3D feature space and sample it
+set.seed(123)
+
+n <- 100
+x_cluster <- runif(3,0,1)
+x1 <- rnorm(n, mean = x_cluster[1], sd = 0.8)
+x2 <- rnorm(n, mean = x_cluster[2], sd = 1)
+x3 <- rnorm(n, mean = x_cluster[3], sd = 1.1)
+y_cluster <- runif(3,0,1)
+y1 <- rnorm(n, mean = y_cluster[1], sd = 0.8)
+y2 <- rnorm(n, mean = y_cluster[2], sd = 1)
+y3 <- rnorm(n, mean = y_cluster[3], sd = 1.1)
+#z will be my categorical variable
+z <- sample(c("A", "B", "C"), n, replace = TRUE)
+
+df_mixed <- data.frame(x = c(x1,x2,x3),
+                      y = c(y1,y2,y3),
+                      z = z) %>%
+  mutate(z = as.factor(z))  # Convert z to a factor for categorical variable
+
+# Sample the mixed feature space
+df_mixed_sampled <- sample_n(df_mixed, size = 100, replace = TRUE)
+
+# Create a 3D scatter plot of feature space with categorical variable
+plot_ly(df_mixed,
+        x = ~x, 
+        y = ~y, 
+        z = ~z, 
+        type = "scatter3d", 
+        mode = "markers",
+        marker = list(size = 2, color = "blue")) %>%
+  layout(title = "3D Scatter Plot of Simulated Feature Space with Categorical Variable",
+         scene = list(xaxis = list(title = "X Axis"),
+                      yaxis = list(title = "Y Axis"),
+                      zaxis = list(title = "Z Axis")))
+
+# Create a 3D scatter plot of sampled feature space with categorical variable
+plot_ly(df_mixed_sampled,
+        x = ~x, 
+        y = ~y, 
+        z = ~z, 
+        type = "scatter3d", 
+        mode = "markers",
+        marker = list(size = 2, color = "red")) %>%
+  layout(title = "3D Scatter Plot of Sampled Feature Space with Categorical Variable",
+         scene = list(xaxis = list(title = "X Axis"),
+                      yaxis = list(title = "Y Axis"),
+                      zaxis = list(title = "Z Axis")))
+```
+
+## Create a multivariate kernel density estimate and plot of the mixed dataframe
+
+```{r}
+# Create a multivariate kernel density estimate using np
+mv_kde_mixed <- npudens(~x + y + z,
+                        data = df_mixed)
+
+# Create a grid over x and y, fix z at a value (e.g., median)
+grid_x <- seq(min(mv_kde_mixed$x), max(mv_kde_mixed), length.out = 50)
+grid_y <- seq(min(mv_kde_mixed$y), max(mv_kde_mixed$y), length.out = 50)
+z_fixed <- median(mv_kde_mixed$z)
+grid <- expand.grid(x = grid_x, y = grid_y, z = z_fixed)
+
+# Predict densities on the grid
+dens_vals <- predict(dens, newdata = grid)
+dens_matrix <- matrix(dens_vals, nrow = 50, ncol = 50)
+
+# Interactive surface plot
+plot_ly(x = grid_x, y = grid_y, z = dens_matrix, type = "surface") %>%
+  layout(
+    title = paste("KDE Slice at z =", round(z_fixed, 2)),
+    scene = list(
+      xaxis = list(title = "x"),
+      yaxis = list(title = "y"),
+      zaxis = list(title = "Density")
+    )
+  )
+```
+
+## Calculate gower distance between potential and sampled data in mixed dataframe
+
+```{r}
+# Calculate mean Gower distance between potential and sampled data in mixed dataframe
+df_mixed_all <- rbind(
+  data.frame(group = "potential", df_mixed),
+  data.frame(group = "sampled", df_mixed_sampled)
+)
+gower_dist_mixed <- daisy(df_mixed_all[, -1], metric = "gower")
+
+gower_matrix_mixed <- as.matrix(gower_dist_mixed)
+
+potential_idx_mixed <- which(df_mixed_all$group == "potential")
+sampled_idx_mixed <- which(df_mixed_all$group == "sampled")
+
+gower_potential_to_sampled_mixed <- gower_matrix_mixed[potential_idx_mixed, sampled_idx_mixed]
+
+gower_mean_mixed <- rowMeans(gower_potential_to_sampled_mixed)
+
+df_mixed <- df_mixed %>%
+  mutate(distance_gower = gower_mean_mixed)
+
+df_mixed$distance_gower <- as.numeric(df_mixed$distance_gower)
+
+df_mixed$z_num <- as.numeric(df_mixed$z)          # For plotting
+z_levels <- levels(df_mixed$z)   
+
+# plot 3d feature space and color points by mean gower distance in mixed dataframe
+
+plot_ly(
+  df_mixed,
+  x = ~x, 
+  y = ~y, 
+  z = ~z_num,                # Use numeric version for position
+  color = ~distance_gower,
+  colors = colorRamp(c("blue", "red")),
+  type = "scatter3d", 
+  mode = "markers",
+  marker = list(size = 2)
+) %>%
+  layout(
+    scene = list(
+      zaxis = list(
+        title = "Z Axis (factor)",
+        tickvals = seq_along(z_levels),    # Numeric positions
+        ticktext = z_levels                # Show factor labels
+      ),
+      xaxis = list(title = "X Axis"),
+      yaxis = list(title = "Y Axis")
+    ),
+    title = "3D Scatter Plot with factor Z"
+  )
+```
+
+#Case Study: Perry Field
+
+##Load in Perry Field data
+
+```{r}
+# Import Perry point data
+perry_point_path <- "../data/willis/soil_points_SP.gpkg"
+
+perry_point_sf <- st_read(perry_point_path)
+
+# Import Perry raster data
+perry_raster_path <- "../data/willis/DEM_50_stack.tif"
+
+perry_raster_spatraster <- rast(perry_raster_path)
+```
+
+##Extract point data from raster
+
+```{r}
+# Extract raster values at point locations
+perry_point_sf <- st_transform(perry_point_sf, crs = st_crs(perry_raster_spatraster))
+
+perry_raster_names <- names(perry_raster_spatraster)
+
+perry_point_values_df <- extract(perry_raster_spatraster, perry_point_sf) %>%
+  mutate(Geomorphons_50cm = as.factor(Geomorphons_50cm)) %>%
+  select(!ID) %>%
+  mutate(across(where(is.numeric), ~ as.vector(scale(.))))
+
+colnames(perry_point_values_df) <- perry_raster_names
+```
+
+##Create raster dataframe and fix missing factor issue
+
+```{r}
+# Create a dataframe of raster values
+perry_raster_df <- as.data.frame(perry_raster_spatraster) %>%
+  filter(complete.cases(.)) %>%
+  mutate(Geomorphons_50cm = as.factor(Geomorphons_50cm)) %>%
+  mutate(across(where(is.numeric), ~ as.vector(scale(.))))
+
+levels(perry_point_values_df$Geomorphons_50cm) <- levels(perry_raster_df$Geomorphons_50cm)
+```
+
+##Calculate Gower distance between potential and sampled data
+
+```{r}
+perry_raster_sample<-perry_raster_df %>%
+  sample_n(size = 10000)
+
+perry_sample_all <- rbind(
+  data.frame(group = "potential", perry_point_values_df),
+  data.frame(group = "sampled", perry_raster_sample)
+)
+
+perry_sample_all_dist <- daisy(perry_sample_all[, -1], metric = "gower")
+
+perry_sample_all_gmatrix <- as.matrix(perry_sample_all_dist)
+
+potential_idx_perrysample <- which(perry_sample_all$group == "potential")
+sampled_idx_perrysample <- which(perry_sample_all$group == "sampled")
+
+sample_to_potential_perrysample <- perry_sample_all_gmatrix[sampled_idx_perrysample, potential_idx_perrysample]
+
+perry_gower_unimean<-mean(sample_to_potential_perrysample)
+
+# start_time<-Sys.time()
+# 
+# perry_gower_topn <- gower_topn(y=perry_point_values_df, x=perry_raster_sample, n=1)
+# 
+# stop_time<-Sys.time()
+# 
+# stop_time-start_time #4 minutes for 100,000 points
+
+perry_gower_topn <- gower_topn(y=perry_point_values_df, x=perry_raster_df, n=1)
+
+# perry_raster_df %>%
+#   cbind(perry_gower_topn$distance)
+  
+```

@@ -9,8 +9,11 @@ format: html
 library(tidyverse)
 library(measurements)
 library(lubridate)
+library(janitor)
 library(tidymodels)
+library(finetune)
 library(ranger)
+library(caret)
 library(vip)
 library(sf)
 library(terra)
@@ -23,7 +26,9 @@ library(ggspatial)
 library(tigris)
 library(rstac)
 library(FedData)
-library(aqp)
+library(soilDB)
+library(CAST)
+library(exactextractr)
 ```
 
 # data wrangling
@@ -33,13 +38,25 @@ library(aqp)
 ```{r}
 ncss_path <- "../data/ncss_labdatagpkg/ncss_labdata.gpkg"
 
+ncssmorph_path <- "../data/NASIS_Morphological_09142021.gdb"
+
 mlra_path <- "../data/MLRA_52_2022/MLRA_52_2022/MLRA_52.shp"
+
+ecoregion_path <- "../data/us_eco_l3/us_eco_l3.shp"
+
+surficialmat_path <- "../data/USGS_DS_425_SHAPES/USGS_DS_425_SHAPES/Surficial_materials.shp"
 
 ssurgo_path <- "../data/ALL_SSURGO_10_01_2024/ALL_SSURGO_gpkg/muraster_30m.tif"
 
 ssurgotable_path <- "../data/ALL_SSURGO_10_01_2024/ALL_SSURGO_gpkg/ALL_SSURGO_10_01_2024.gpkg"
 
-dem_path <- "../data/dem/"
+sharma_path <- "../data/sharma_pedon/"
+
+raca_path <- "../data/raca_pedon/"
+
+ncsu_path <- "../data/ncsu_pedon/25_seeit_ncsu_pedons_coastalplain.csv"
+
+dem_path <- "../data/topo_dem/dem30_conus"
 
 topo_path <- "../data/topo_deriv/"
 
@@ -55,9 +72,29 @@ nlcd_path <- "../data/nlcd/"
 ### read
 
 ```{r}
-st_layers(ncss_path)
+ncss_layers<-st_layers(ncss_path)
 
 ncss_table_layer <- st_read(ncss_path,layer = "lab_layer")
+
+ncss_table_chemical <- st_read(ncss_path,layer = "lab_chemical_properties")
+
+ncss_table_physical <- st_read(ncss_path,layer = "lab_physical_properties")
+
+ncssmorph_layers <- st_layers(ncssmorph_path)
+
+ncssmorph_table_ncsspedon <- st_read(ncssmorph_path,layer = "ncsspedonlabdata") %>%
+  distinct()
+
+ncssmorph_table_ncsslayer <- st_read(ncssmorph_path,layer = "ncsslayerlabdata") %>%
+  distinct()
+
+ncssmorph_table_pedon <- st_read(ncssmorph_path,layer = "pedon")
+
+ncssmorph_table_structure <- st_read(ncssmorph_path,layer = "phstructure")
+
+ncssmorph_table_hzn<- st_read(ncssmorph_path,layer = "phorizon")
+
+ncssmorph_table_ped<- st_read(ncssmorph_path,layer = "pedon")
 
 st_layers(ssurgotable_path)
 
@@ -68,6 +105,233 @@ muaggatt_table <- st_read(ssurgotable_path,layer = "muaggatt", fid_column_name =
 component_table <- st_read(ssurgotable_path,layer = "component", fid_column_name = "cokey")
 
 chorizon_table <- st_read(ssurgotable_path,layer = "chorizon")
+
+sharma_files <- list.files(sharma_path, pattern = "*.csv$",full.names = T)
+
+clean_string <- function(x) {
+  x <- tolower(x)
+  x <- gsub("[^a-zA-Z0-9 ]", "", x)
+  x <- gsub("-", "_", x)
+  x <- gsub("\\s+", "", x)
+  x <- gsub("csv", "", x)
+  x <- gsub("xlsx", "", x)
+  x <- trimws(x)
+  return(x)
+}
+
+sharma_names<-list.files(sharma_path, pattern = "*.csv$",full.names = F) %>%
+  clean_string()
+
+sharma_list<-lapply(sharma_files, read_csv) %>%
+  setNames(sharma_names)
+
+list2env(sharma_list, envir = .GlobalEnv)
+
+raca_files <- list.files(raca_path, pattern = "*.csv$",full.names = T)
+
+raca_names<-list.files(raca_path, pattern = "*.csv$",full.names = F) %>%
+  clean_string()
+
+raca_list<-lapply(raca_files, read_csv) %>%
+  setNames(raca_names)
+
+list2env(raca_list, envir = .GlobalEnv)
+
+ncsu_table_raw <- read_csv(ncsu_path)
+```
+### clean
+
+```{r}
+ncsspedon_table<-st_read(ncss_path) %>%
+  clean_names() %>%
+  cbind(st_coordinates(.)) %>%
+  st_drop_geometry() %>%
+  rename(
+    lat = Y,
+    long = X)
+
+ncsslayer_table<-ncss_table_layer %>%
+  select(pedon_key, layer_key, hzn_top, hzn_bot) %>%
+  left_join(ncss_table_chemical %>%
+              select(layer_key, organic_carbon_walkley_black, total_carbon_ncs), by = "layer_key") %>%
+  left_join(ncss_table_physical %>%
+              select(layer_key, bulk_density_oven_dry), by = "layer_key") %>%
+  mutate(soc_per = case_when(
+    !is.na(total_carbon_ncs) ~ total_carbon_ncs,
+    !is.na(organic_carbon_walkley_black) ~ organic_carbon_walkley_black,
+    TRUE ~ NA_real_
+  )) %>%
+  rename(bd_cm3 = bulk_density_oven_dry) %>%
+  select(pedon_key, hzn_top, hzn_bot, soc_per, bd_cm3) %>%
+  filter(complete.cases(.))
+
+ncsslayer_spc <- ncsslayer_table
+
+aqp::depths(ncsslayer_spc) <- pedon_key ~ hzn_top + hzn_bot
+
+ncsslayer_soc20 <- ncsslayer_spc %>%
+  slab(pedon_key ~ soc_per, SPC = T, slab.structure = c(0,20), slab.fun = mean) %>%
+  filter(contributing_fraction == 1) %>%
+  rename(soc_per = value)
+
+ncsslayer_bd20 <- ncsslayer_spc %>%
+  slab(pedon_key ~ bd_cm3, SPC = T, slab.structure = c(0,20), slab.fun = mean) %>%
+  filter(contributing_fraction == 1) %>%
+  rename(bd_cm3 = value)
+
+ncss_table <- ncsslayer_soc20 %>%
+  left_join(ncsslayer_bd20, by = "pedon_key") %>%
+  mutate(soc_mgha = soc_per/100 * bd_cm3 * 20 * 100) %>%
+  select(pedon_key,soc_mgha) %>%
+  left_join(ncsspedon_table %>%
+              mutate(samp_year = year(ymd_hms(samp_classdate))) %>%
+              select(pedon_key, lat, long, samp_year) %>%
+              mutate(pedon_key = as.character(pedon_key)),
+            by = "pedon_key") %>%
+  distinct() %>%
+  filter(complete.cases(.))
+
+cochran_table<-cochransoc20 %>%
+  clean_names() %>%
+  mutate(pedon_key = pedon_id_3) %>%
+  mutate(soc_mgha = soc_stock_20_g_m2/100) %>%
+  mutate(samp_year = 2009) %>%
+  select(pedon_key, soc_mgha,lat,long,samp_year)
+
+kevin_table_soc20<-kevinsoc20 %>%
+  clean_names() %>%
+  mutate(pedon_key = group_1) %>%
+  mutate(soc_mgha = soc_20_stock/100)
+
+kevin_table_coor<-kevinloc %>%
+  clean_names() %>%
+  mutate(pedon_key = plot) %>%
+  mutate(lat = utm_n16_y) %>%
+  mutate(long = utm_n16_x) %>%
+  select(pedon_key, lat, long) %>%
+  distinct() %>%
+  filter(pedon_key %in% kevin_table_soc20$pedon_key)
+
+kevin_table <- kevin_table_soc20 %>%
+  left_join(kevin_table_coor, by = "pedon_key") %>%
+  mutate(samp_year = 2018) %>%
+  select(pedon_key, soc_mgha, lat, long, samp_year)
+
+levi_table <- levisoc20 %>%
+  clean_names() %>%
+  mutate(pedon_key = site_id) %>%
+  mutate(soc_mgha = soc_stock_20/100) %>%
+  mutate(lat = lat_in_dec) %>%
+  mutate(long = long_in_dec) %>%
+  mutate(samp_year = 2007) %>%
+  select(pedon_key, soc_mgha, lat, long,samp_year)
+ 
+# raca_table <- racasoc20 %>%
+#   janitor::clean_names() %>%
+#   mutate(
+#     pedon_key = upedonid_3,
+#     soc_mgha = soc_20_stock_g_m2 / 100,
+#     lat = gen_lat,
+#     long = gen_long,
+#     samp_year = 2013
+#   ) %>%
+#   select(pedon_key, soc_mgha, lat, long, samp_year)
+
+racacoor_table <- racagenerallocation %>%
+  janitor::clean_names() %>%
+  distinct(ra_ca_id, .keep_all = TRUE)
+
+racasample_table <- racasamples %>%
+  janitor::clean_names() %>%
+  left_join(racacoor_table, by = c("rcasiteid" = "ra_ca_id")) %>%
+  filter(!is.na(c_tot_ncs)) %>%
+  rename(
+    pedon_key = rcasiteid,
+    lat = gen_lat,
+    long = gen_long,
+    hzn_top = top,
+    hzn_bot = bot)
+
+racasample_spc <- racasample_table
+
+aqp::depths(racasample_spc) <- pedon_key ~ hzn_top + hzn_bot
+
+racasample_soc20 <- racasample_spc %>%
+  slab(pedon_key ~ c_tot_ncs, SPC = T, slab.structure = c(0,20), slab.fun = mean) %>%
+  filter(contributing_fraction == 1) %>%
+  rename(soc_per = value) 
+
+racasample_bd20 <- racasample_spc %>%
+  slab(pedon_key ~ measure_bd, SPC = T, slab.structure = c(0,20), slab.fun = mean) %>%
+  filter(contributing_fraction == 1) %>%
+  rename(bd_cm3 = value)
+
+raca_table <- racasample_soc20 %>%
+  left_join(racasample_bd20, by = c("pedon_key" = "pedon_key")) %>%
+  mutate(soc_mgha = soc_per/100 * bd_cm3 * 20 * 100,
+         samp_year = 2013) %>%
+  select(pedon_key,soc_mgha,samp_year) %>%
+  left_join(racasample_table %>%
+              select(pedon_key, lat, long),
+            by = c("pedon_key"="pedon_key")) %>%
+  distinct() %>%
+  filter(complete.cases(.))
+
+ricker_table <- rickersoc20 %>%
+  clean_names() %>%
+  mutate(pedon_key = plot) %>%
+  mutate(soc_mgha = soc_stock_20/100) %>%
+  mutate(lat = y) %>%
+  mutate(long = x) %>%
+  mutate(samp_year = 2013) %>%
+  select(pedon_key, soc_mgha, lat, long,samp_year)
+
+ncsu_table_clean <- ncsu_table_raw %>%
+  clean_names() %>%
+  select(pedon_key_whole, 	
+latitude_decimal_degrees, longitude_decimal_degrees, samp_classdate,hzn_top,hzn_bot,hzn_desgn,total_carbon_ncs,bulk_density_oven_dry) %>%
+  mutate(pedon_key = pedon_key_whole) %>%
+  mutate(samp_year = case_when(
+    !is.na(samp_classdate) ~ year(mdy(samp_classdate)),
+    is.na(samp_classdate) ~ 2023)) %>%
+  mutate(samp_yearold = samp_year-10) %>%
+  rename(lat = latitude_decimal_degrees, long = longitude_decimal_degrees) %>%
+  mutate(lat_dms = regmatches(lat, gregexpr("[0-9.]+", lat))) %>%
+  mutate(
+    lat_deg = as.numeric(sapply(lat_dms, `[`, 1)),
+    lat_min = as.numeric(sapply(lat_dms, `[`, 2)),
+    lat_sec = as.numeric(sapply(lat_dms, `[`, 3))
+  ) %>%
+  mutate(lat_decimal = lat_deg + lat_min / 60 + lat_sec / 3600) %>%
+  mutate(long_dms = regmatches(long, gregexpr("[0-9.]+", long))) %>%
+  mutate(
+    long_deg = as.numeric(sapply(long_dms, `[`, 1)),
+    long_min = as.numeric(sapply(long_dms, `[`, 2)),
+    long_sec = as.numeric(sapply(long_dms, `[`, 3))
+  ) %>%
+  mutate(long_decimal = -1*(long_deg + long_min / 60 + lat_sec / 3600))
+
+ncsu_spc_clean <- ncsu_table_clean
+
+aqp::depths(ncsu_spc_clean) <- pedon_key ~ hzn_top + hzn_bot
+
+ncsu_soc20 <- ncsu_spc_clean %>%
+  slab(pedon_key ~ total_carbon_ncs, SPC = T, slab.structure = c(0,20), slab.fun = mean) %>%
+  rename(soc_per = value)
+
+ncsu_bd20 <- ncsu_spc_clean %>%
+  slab(pedon_key ~ bulk_density_oven_dry, SPC = T, slab.structure = c(0,20), slab.fun = mean) %>%
+  rename(bd_cm3 = value)
+
+ncsu_table <- ncsu_soc20 %>%
+  left_join(ncsu_bd20, by = c("pedon_key" = "pedon_key")) %>%
+  mutate(soc_mgha = soc_per/100 * bd_cm3 * 20 * 100) %>%
+  select(pedon_key,soc_mgha) %>%
+  left_join(ncsu_table_clean %>%
+              select(pedon_key, lat_decimal, long_decimal, samp_year),
+            by = c("pedon_key"="pedon_key")) %>%
+  rename(lat = lat_decimal, long = long_decimal) %>%
+  distinct()
 ```
 
 ## vector data
@@ -96,8 +360,30 @@ states_sf <- tigris::states(cb = TRUE) %>%
 
 mlra_sf <- st_read(mlra_path)
 
-ncss_sf <- st_read(ncss_path)
+ecoregion_sf <- st_read(ecoregion_path)
 
+surficialmat_sf <- st_read(surficialmat_path)
+
+ncss_sf <- ncss_table %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+cochran_sf <- cochran_table %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+kevin_sf <- kevin_table %>%
+  st_as_sf(coords = c("long", "lat"), crs = 32616)
+
+levi_sf <- levi_table %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+raca_sf <- raca_table %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
+
+ricker_sf <- ricker_table %>%
+  st_as_sf(coords = c("long", "lat"), crs = 32617)
+
+ncsu_sf <- ncsu_table %>%
+  st_as_sf(coords = c("long", "lat"), crs = 4326)
 ```
 
 ### project
@@ -125,10 +411,38 @@ mlra_sfp <- mlra_sf %>%
 
 plot(st_geometry(mlra_sfp))
 
+ecoregion_sfp <- ecoregion_sf %>%
+  st_transform(crs = epsg_val)
+
+plot(st_geometry(ecoregion_sfp))
+
+surficialmat_sfp <- surficialmat_sf %>%
+  st_transform(crs = epsg_val)
+
+plot(st_geometry(surficialmat_sfp))
+
 ncss_sfp <- ncss_sf %>%
   st_transform(crs = epsg_val)
 
 plot(st_geometry(ncss_sfp))
+
+cochran_sfp <- cochran_sf %>%
+  st_transform(crs = epsg_val)
+
+kevin_sfp <- kevin_sf %>%
+  st_transform(crs = epsg_val)
+
+levi_sfp <- levi_sf %>%
+  st_transform(crs = epsg_val)
+
+raca_sfp <- raca_sf %>%
+  st_transform(crs = epsg_val)
+
+ricker_sfp <- ricker_sf %>%
+  st_transform(crs = epsg_val)
+
+ncsu_sfp <- ncsu_sf %>%
+  st_transform(crs = epsg_val)
 ```
 
 ### filter
@@ -150,19 +464,44 @@ plot(st_geometry(mlra_sfpf))
 
 ncss_sfpf <- ncss_sfp %>%
   st_intersection(mlra_sfpf) %>%
-  mutate(samp_year = year(ymd_hms(samp_classdate))) %>%
   mutate(samp_yearold = samp_year-10) %>%
   filter(samp_year > 1995)
 
-plot(st_geometry(ncss_sfpf))
-```
+cochran_sfpf <- cochran_sfp %>%
+  st_intersection(mlra_sfpf) %>%
+  mutate(samp_yearold = samp_year-10)
 
-### save
+kevin_sfpf <- kevin_sfp %>%
+  st_intersection(mlra_sfpf) %>%
+  mutate(samp_yearold = samp_year-10)
 
-```{r}
-mlra_sfpf_path <- paste0("../data/vector/",substitute(mlra_sfpf),".shp")
+levi_sfpf <- levi_sfp %>%
+  st_intersection(mlra_sfpf) %>%
+  mutate(samp_yearold = samp_year-10)
 
-write_sf(mlra_sfpf,mlra_sfpf_path)
+raca_sfpf <- raca_sfp %>%
+  st_intersection(mlra_sfpf) %>%
+  mutate(samp_yearold = samp_year-10)
+
+ricker_sfpf <- ricker_sfp %>%
+  st_intersection(mlra_sfpf) %>%
+  mutate(samp_yearold = samp_year-10)
+
+ncsu_sfpf <- ncsu_sfp %>%
+  st_intersection(mlra_sfpf) %>%
+  mutate(samp_yearold = samp_year-10)
+
+all_sfpf <- ncss_sfpf %>%
+  rbind(cochran_sfpf) %>%
+  rbind(kevin_sfpf) %>%
+  rbind(levi_sfpf) %>%
+  rbind(raca_sfpf) %>%
+  rbind(ricker_sfpf) %>%
+  rbind(ncsu_sfpf)
+
+all_sfpf_path <- paste0("../data/vector/",substitute(all_sfpf),".gpkg")
+
+write_sf(all_sfpf,all_sfpf_path)
 ```
 
 ## raster data
@@ -172,14 +511,7 @@ write_sf(mlra_sfpf,mlra_sfpf_path)
 ```{r}
 ssurgo_spatrast <- rast(ssurgo_path)
 
-topo_files <- list.files(topo_path, pattern = "*.tif$",full.names = T)
-
-topo_spatrast <- rast(topo_files)
-
-dem_files <- list.files(dem_path, pattern = "*.tif$",full.names = T)
-
-dem_sprc <- lapply(dem_files, rast) %>%
-  sprc()
+dem_spatrast <- rast(dem_path)
 
 map_spatrast <- rast(map_path)
 
@@ -188,16 +520,6 @@ mat_spatrast <- rast(mat_path)
 nlcd_files <- list.files(nlcd_path, pattern = "*.tif$",full.names = T)
 
 nlcd_spatrast <- rast(nlcd_files)
-```
-
-### mosaic
-
-```{r}
-dem_spatrast <- mosaic(dem_sprc, fun = mean)
-
-writeRaster(dem_spatrast,"../data/raster/dem_spatrast.tif", overwrite = T)
-
-plot(dem_spatrast)
 ```
 
 ### crop & mask
@@ -254,20 +576,6 @@ nlcdc_spatrast <- nlcd_spatrast %>%
 nlcdc_spatrast_path <- paste0("../data/raster/",substitute(nlcdc_spatrast),".tif")
 
 writeRaster(nlcdc_spatrast,nlcdc_spatrast_path, overwrite = T)
-```
-
-### read crop
-
-```{r}
-ssurgoc_spatrast <- rast("../data/raster/ssurgoc_spatrast.tif")
-
-demc_spatrast <- rast("../data/raster/demc_spatrast.tif")
-
-mapc_spatrast <- rast("../data/raster/mapc_spatrast.tif")
-
-matc_spatrast <- rast("../data/raster/matc_spatrast.tif")
-
-nlcdc_spatrast <- rast("../data/raster/nlcdc_spatrast.tif")
 ```
 
 ### project
@@ -330,7 +638,15 @@ nlcdcp_spatrast_path <- paste0("../data/raster/",substitute(nlcdcp_spatrast),".t
 writeRaster(nlcdcp_spatrast,nlcdcp_spatrast_path, overwrite = T)
 ```
 
-### read project
+## clean data
+
+### read clean points
+
+```{r}
+all_sfpf <- st_read("../data/vector/all_sfpf.gpkg")
+```
+
+### read clean raster
 
 ```{r}
 ssurgo_spatrastcp <- rast("../data/raster/ssurgo_spatrastcp.tif")
@@ -346,6 +662,214 @@ nlcdcp_spatrast <- rast("../data/raster/nlcdcp_spatrast.tif")
 
 # feature engineering
 
+### soc stock &  bd pedotransfer function
+
+```{r}
+ncss_sfp_ecoregion <- ncss_sfp %>%
+  st_intersection(ecoregion_sfp) %>%
+  st_drop_geometry() %>%
+  select(pedon_key, US_L3NAME)
+
+ncss_sfp_surficialmat <- ncss_sfp %>%
+  st_intersection(surficialmat_sfp) %>%
+  st_drop_geometry() %>%
+  select(pedon_key, UNIT_NAME)
+
+ncss_pedonkey <- ncss_sf %>%
+  select(pedon_key,upedonid) %>%
+  st_drop_geometry() %>%
+  distinct()
+
+ncss_table_temp<- ncss_table_layer %>%
+  left_join(ncss_pedonkey, by = "pedon_key") %>%
+  select(upedonid,pedon_key,layer_key,hzn_desgn_old, hzn_desgn, hzn_top,hzn_bot)
+
+ncssmorph_pedonkey <- ncssmorph_table_pedon %>%
+  select(upedonid,peiid) %>%
+  st_drop_geometry() %>%
+  distinct()
+
+ncssmorph_hznkey <- ncssmorph_table_hzn %>%
+  select(peiidref,phiid,hzdept,hzdepb,hzname) %>%
+  distinct()
+
+ncssmorph_key <- ncssmorph_hznkey %>%
+  merge(ncssmorph_pedonkey, by.x = "peiidref", by.y = "peiid") %>%
+  select(hzname, upedonid,phiid)
+
+ncssmorph_table_structure_hzn<- ncssmorph_key %>%
+  left_join(ncssmorph_table_structure, by = c("phiid" = "phiidref")) %>%
+  group_by(upedonid,hzname) %>%
+  dplyr::slice(1) %>%
+  ungroup() %>%
+  select(upedonid,hzname,structsize,structtype)
+
+ncss_table_structure_old <- ncss_table_temp %>%
+  left_join(ncssmorph_table_structure_hzn, by = c("upedonid" = "upedonid","hzn_desgn_old" = "hzname")) %>%
+  select(upedonid,pedon_key,layer_key,hzn_desgn_old, hzn_desgn,structsize,structtype)
+
+ncss_table_structure_new <- ncss_table_temp %>%
+  left_join(ncssmorph_table_structure_hzn, by = c("upedonid" = "upedonid","hzn_desgn" = "hzname")) %>%
+  select(upedonid,pedon_key,layer_key,hzn_desgn_old, hzn_desgn,structsize,structtype)
+
+coalesce_duplicated_columns <- function(df) {
+  x_cols <- names(df)[str_ends(names(df), "\\.x$")]
+  base_names <- str_remove(x_cols, "\\.x$")
+  
+  for (nm in base_names) {
+    x_col <- paste0(nm, ".x")
+    y_col <- paste0(nm, ".y")
+    if (x_col %in% names(df) && y_col %in% names(df)) {
+      df[[nm]] <- coalesce(df[[x_col]], df[[y_col]])
+      df[[x_col]] <- NULL
+      df[[y_col]] <- NULL
+    }
+  }
+  df
+}
+
+ncss_table_structure <- ncss_table_structure_new %>%
+  left_join(ncss_table_structure_old, by = "layer_key") %>%
+  coalesce_duplicated_columns()
+
+ncss_table_carbonph <- ncss_table_temp %>%
+  left_join(ncss_table_chemical, by = c("layer_key" = "layer_key"))%>%
+  select(layer_key, total_carbon_ncs, organic_carbon_walkley_black,ph_h2o,hzn_desgn,pedon_key) %>%
+  mutate(soc_per = case_when(
+    !is.na(total_carbon_ncs) ~ total_carbon_ncs,
+    !is.na(organic_carbon_walkley_black) ~ organic_carbon_walkley_black,
+    TRUE ~ NA_real_
+  )) %>%
+  select(hzn_desgn, soc_per,ph_h2o,layer_key,pedon_key)
+
+ncss_table_bdtex <- ncss_table_temp %>%
+    left_join(ncss_table_physical, by = c("layer_key" = "layer_key")) %>%
+  select(bulk_density_oven_dry,clay_total,sand_total,hzn_desgn,layer_key,pedon_key,hzn_top,hzn_bot)
+
+ncss_table_combined <- ncss_table_structure %>%
+  left_join(ncss_table_carbonph, by = c("layer_key" = "layer_key")) %>%
+  left_join(ncss_table_bdtex, by = c("layer_key" = "layer_key")) %>%
+  left_join(ncss_sfp_ecoregion,by = c("pedon_key" = "pedon_key")) %>%
+  left_join(ncss_sfp_surficialmat,by = c("pedon_key" = "pedon_key")) %>%
+  coalesce_duplicated_columns() %>%
+  mutate(structsize = case_when(
+  structtype == "Single grain" ~ "Other",
+  structtype == "Massive" ~ "Other",
+  TRUE ~ as.character(structsize)
+  ))
+
+ncss_table_coastalplain <- ncss_table_combined %>%
+  filter(pedon_key %in% ncss_sfpf$pedon_key)
+
+ncss_spc_coastalplain <- ncss_table_coastalplain
+
+depths(ncss_spc_coastalplain) <- pedon_key ~ hzn_top + hzn_bot
+
+ncss_spc_coastalplain20 <- trunc(ncss_spc_coastalplain,0,20) %>%
+  as.data.frame()
+
+ncss_table_valid <- ncss_table_combined %>%
+  select(soc_per, ph_h2o, clay_total, sand_total, structsize, structtype, hzn_desgn, US_L3NAME, UNIT_NAME,hzn_top,hzn_bot, bulk_density_oven_dry,pedon_key) %>%
+  filter(complete.cases(.))
+
+ncss_table_validbd <- ncss_spc_coastalplain20 %>%
+  filter(!is.na(bulk_density_oven_dry)) %>%
+  select(soc_per, ph_h2o, clay_total, sand_total, structsize, structtype, hzn_desgn, US_L3NAME, UNIT_NAME,hzn_top,hzn_bot, bulk_density_oven_dry,pedon_key)
+
+ncss_table_missingbd <- ncss_spc_coastalplain20 %>%
+  filter(is.na(bulk_density_oven_dry)) %>%
+  select( soc_per, ph_h2o, clay_total, sand_total, structsize, structtype, hzn_desgn, US_L3NAME, UNIT_NAME,hzn_top,hzn_bot,pedon_key) %>%
+  filter(complete.cases(.)) 
+
+library(randomForestSRC)
+library(clhs)
+
+set.seed(123)
+
+Peds_complete <- ncss_table_valid %>%
+  subset(ncss_table_valid$hzn_bot <= 200) %>%
+  dplyr::slice(-1)
+
+cs <- clhs(Peds_complete, size  = nrow(Peds_complete)/2, progress = FALSE, simple = FALSE)
+
+calib_data <- cs$sampled_data %>%
+  mutate(across(where(is.character), as.factor))
+  
+
+rfsrc_BD <- rfsrc(bulk_density_oven_dry ~ soc_per + ph_h2o + sand_total + clay_total + hzn_bot + structsize + structtype + UNIT_NAME + US_L3NAME + hzn_desgn, data=calib_data, ntree=150)
+
+bd_predict <- predict.rfsrc(rfsrc_BD, newdata = ncss_table_missingbd)
+
+ncss_table_ptfbd <- ncss_table_missingbd %>%
+  mutate(bulk_density_oven_dry = bd_predict$predicted)
+
+ncss_table_complete <- ncss_table_ptfbd %>%
+  rbind(ncss_table_validbd)
+
+write.csv(ncss_table_complete,"../data/tabular/ncss_table_complete.csv", row.names = F)
+
+ncss_table_stocks <- read.csv("../data/tabular/ncss_table_complete.csv")
+
+depths(ncss_table_stocks) <- pedon_key ~ hzn_top + hzn_bot
+
+ncss_table_validstocks <- as.data.frame(ncss_table_stocks) %>%
+  mutate(soc_stock_mgha = soc_per * bulk_density_oven_dry * (hzn_bot - hzn_top))
+
+ncss_table_validstocks20 <- ncss_table_validstocks %>%
+  group_by(pedon_key) %>%
+  summarise(
+    soc_stock_mgha = sum(soc_stock_mgha, na.rm = TRUE)
+  )
+
+# depths(ncss_table_validstocks) <- pedon_key ~ hzn_top + hzn_bot
+#   
+#  ncss_soc20<-ncss_table_validstocks %>%
+#   slab(pedon_key ~ soc_per, SPC = F, slab.structure = c(0,20), slab.fun = sum) %>%
+#    filter(contributing_fraction == 1) 
+
+write.csv(ncss_table_validstocks20,"../data/tabular/ncss_table_validstocks20.csv", row.names = F)
+
+ncss_sfpf_geom<-ncss_sfpf %>%
+  select(pedon_key, Shape,samp_year,samp_yearold)
+
+finalncss_sfpf <- read.csv("../data/tabular/ncss_table_validstocks20.csv") %>%
+  rename(soc_mgha = soc_stock_mgha) %>%
+  left_join(ncss_sfpf_geom, by = c("pedon_key" = "pedon_key")) %>%
+  rename(geometry = Shape)
+
+nonncss_sfpf <- cochran_sfpf %>%
+  rbind(kevin_sfpf) %>%
+  rbind(levi_sfpf) %>%
+  rbind(raca_sfpf) %>%
+  rbind(ricker_sfpf) %>%
+  rbind(ncsu_sfpf) %>%
+  select(pedon_key, soc_mgha, samp_year, samp_yearold)
+  
+final_sfpf <- finalncss_sfpf %>%
+  rbind(nonncss_sfpf) %>%
+  st_as_sf()
+
+st_write(final_sfpf,"../data/vector/final_sfpf.gpkg", delete_dsn = T)
+
+final_sfpf <- st_read("../data/vector/final_sfpf.gpkg")
+
+```
+### MAT and MAP
+
+```{r}
+final_sfpf$map<-extract(mapcp_spatrast, final_sfpf,bind=FALSE)[[2]]
+
+final_sfpf$mat<-extract(matcp_spatrast, final_sfpf,bind=FALSE)[[2]]
+
+all_sfpf$mat<-extract(matcp_spatrast, all_sfpf,bind=FALSE)[[2]]
+
+all_sfpf$map<-extract(mapcp_spatrast, all_sfpf,bind=FALSE)[[2]]
+
+climate_spatrast<-c(mapcp_spatrast,matcp_spatrast)
+
+```
+
+
 ### slope and aspect
 
 ```{r}
@@ -355,26 +879,61 @@ slopeaspect_spatrast$southwestness<-cos(slopeaspect_spatrast$aspect-225)
 
 writeRaster(slopeaspect_spatrast,"../data/raster/slopeaspect_spatrast.tif", overwrite = T)
 
-ncss_sfpf$slope<-extract(slopeaspect_spatrast$slope, ncss_sfpf)
+demcp_spatrast <- rast("../data/raster/demcp_spatrast.tif")
 
-ncss_sfpf$aspect<-extract(slopeaspect_spatrast$aspect, ncss_sfpf)
+names(demcp_spatrast) <- "elevation"
+
+slopeaspect_spatrast <- rast("../data/raster/slopeaspect_spatrast.tif")
+
+final_sfpf$elevation<-extract(demcp_spatrast$elevation, final_sfpf,bind=FALSE)[[2]]
+
+final_sfpf$slope<-extract(slopeaspect_spatrast$slope, final_sfpf,bind=FALSE)[[2]]
+
+final_sfpf$southwestness<-extract(slopeaspect_spatrast$southwestness, final_sfpf,bind=FALSE)[[2]]
+
+all_sfpf$elevation<-extract(demcp_spatrast$elevation, all_sfpf,bind=FALSE)[[2]]
+
+all_sfpf$slope<-extract(slopeaspect_spatrast$slope, all_sfpf,bind=FALSE)[[2]]
+
+all_sfpf$southwestness<-extract(slopeaspect_spatrast$southwestness, all_sfpf,bind=FALSE)[[2]]
+
+topo_spatrast<-c(demcp_spatrast,slopeaspect_spatrast)
 ```
 
 ### landcover change
 
 ```{r}
-ncss_sfpf$samp_nlcdyear <- paste0("nlcd_", ncss_sfpf$samp_year)
-ncss_sfpf$samp_nlcdyearold <- paste0("nlcd_", ncss_sfpf$samp_yearold)
+nlcd_names <- paste0("nlcd_", c(1985:2023))
 
-ncss_sfpf$landcover <- sapply(1:nrow(ncss_sfpf), function(i) {
-  samp_year <- ncss_sfpf$samp_nlcdyear[i]
-  extract(nlcdcp_spatrast[[samp_year]], ncss_sfpf[i, , drop = FALSE])[[2]]
+names(nlcdcp_spatrast) <- nlcd_names
+
+final_sfpf$samp_nlcdyear <- paste0("nlcd_", final_sfpf$samp_year)
+final_sfpf$samp_nlcdyearold <- paste0("nlcd_", final_sfpf$samp_yearold)
+
+final_sfpf$landcover <- sapply(1:nrow(final_sfpf), function(i) {
+  samp_year <- final_sfpf$samp_nlcdyear[i]
+  extract(nlcdcp_spatrast[[samp_year]], final_sfpf[i, , drop = FALSE])[[2]]
 })
 
-ncss_sfpf$landcover_old <- sapply(1:nrow(ncss_sfpf), function(i) {
-  samp_year <- ncss_sfpf$samp_nlcdyearold[i]
-  extract(nlcdcp_spatrast[[samp_year]], ncss_sfpf[i, , drop = FALSE])[[2]]
+final_sfpf$landcover_old <- sapply(1:nrow(final_sfpf), function(i) {
+  samp_year <- final_sfpf$samp_nlcdyearold[i]
+  extract(nlcdcp_spatrast[[samp_year]], final_sfpf[i, , drop = FALSE])[[2]]
 })
+
+all_sfpf$samp_nlcdyear <- paste0("nlcd_", all_sfpf$samp_year)
+all_sfpf$samp_nlcdyearold <- paste0("nlcd_", all_sfpf$samp_yearold)
+
+all_sfpf$landcover <- sapply(1:nrow(all_sfpf), function(i) {
+  samp_year <- all_sfpf$samp_nlcdyear[i]
+  extract(nlcdcp_spatrast[[samp_year]], all_sfpf[i, , drop = FALSE])[[2]]
+})
+
+all_sfpf$landcover_old <- sapply(1:nrow(all_sfpf), function(i) {
+  samp_year <- all_sfpf$samp_nlcdyearold[i]
+  extract(nlcdcp_spatrast[[samp_year]], all_sfpf[i, , drop = FALSE])[[2]]
+})
+
+nlcd2023_spatrast <- c(nlcdcp_spatrast$nlcd_2023,nlcdcp_spatrast$nlcd_2013)
 ```
 
 ### soil taxonomy and properties (order, suborder, great group, subgroup, pH, erosional phase, drainage class, particle size, HSG)
@@ -393,14 +952,6 @@ component_tablef <- component_table %>%
   filter(comppct_r == max(comppct_r)) %>%
   ungroup() %>%
   select(compname,cokey,mukey,erocl,hydgrp,drainagecl,taxpartsize,taxorder,taxsuborder,taxgrtgroup,taxsubgrp,hydgrp)
-
-component_tablef$taxorder %>%
-  unique() %>%
-  sort()
-
-component_tablef$taxsuborder %>%
-  unique() %>%
-  sort()
 
 component_tablef_mod<-component_tablef %>%
   mutate(taxsuborder_mod = case_when(
@@ -550,98 +1101,145 @@ greatgroup_table <- component_tablef_mod %>%
   select(mukey,taxgrtgroup_mod) %>%
   mutate(taxgrtgroup_mod = as.numeric(as.factor(taxgrtgroup_mod)))
 
+greatgroup_label <- component_tablef_mod %>%
+  select(taxgrtgroup_mod) %>%
+  mutate(taxgrtgroup_mod_num = as.numeric(as.factor(taxgrtgroup_mod))) %>%
+  distinct() %>%
+  select(taxgrtgroup_mod_num,taxgrtgroup_mod) %>%
+  arrange(taxgrtgroup_mod_num) %>%
+  drop_na()
+
 greatgroup_spatrast<-classify(ssurgo_spatrastcp, greatgroup_table)
+
+names(greatgroup_spatrast) <- "taxgrtgroup_mod"
+
+levels(greatgroup_spatrast) <- greatgroup_label
 
 greatgroup_spatrast_path <- paste0("../data/raster/",substitute(greatgroup_spatrast),".tif")
 
 writeRaster(greatgroup_spatrast,greatgroup_spatrast_path, overwrite = T)
 
-greatgroup_spatrast<-rast("../data/raster/greatgroup_spatrast.tif")
-
-names(greatgroup_spatrast) <- "taxgrtgroup_mod"
-
 subgroup_table <- component_tablef_mod %>%
   select(mukey,taxsubgrp_mod) %>%
   mutate(taxsubgrp_mod = as.numeric(as.factor(taxsubgrp_mod)))
 
+subgroup_label <- component_tablef_mod %>%
+  select(taxsubgrp_mod) %>%
+  mutate(taxsubgrp_mod_num = as.numeric(as.factor(taxsubgrp_mod))) %>%
+  distinct() %>%
+  select(taxsubgrp_mod_num,taxsubgrp_mod) %>%
+  arrange(taxsubgrp_mod_num) %>%
+  drop_na()
+
 subgroup_spatrast<-classify(ssurgo_spatrastcp, subgroup_table)
+
+names(subgroup_spatrast) <- "taxsubgrp_mod"
+
+levels(subgroup_spatrast) <- subgroup_label
 
 subgroup_spatrast_path <- paste0("../data/raster/",substitute(subgroup_spatrast),".tif")
 
 writeRaster(subgroup_spatrast,subgroup_spatrast_path, overwrite = T)
-
-subgroup_spatrast<-rast("../data/raster/subgroup_spatrast.tif")
-
-names(subgroup_spatrast) <- "taxsubgrp_mod"
 
 pH_table <- component_tablef_pH %>%
   select(mukey,ph1to1h2o_r)
 
 pH_spatrast<-classify(ssurgo_spatrastcp, pH_table)
 
+names(pH_spatrast) <- "ph1to1h2o_r"
+
 pH_spatrast_path <- paste0("../data/raster/",substitute(pH_spatrast),".tif")
 
 writeRaster(pH_spatrast,pH_spatrast_path, overwrite = T)
 
-pH_spatrast<-rast("../data/raster/pH_spatrast.tif")
-
-names(pH_spatrast) <- "ph1to1h2o_r"
-
-erocl_table <- component_tablef_mod %>%
+erocl_table <- component_tablef %>%
   select(mukey,erocl) %>%
-  mutate(erocl = as.numeric(as.factor(erocl)))
+  mutate(erocl = as.numeric(as.factor(erocl))) %>%
+  mutate(erocl = replace_na(erocl, 6))
+
+erocl_label <- component_tablef %>%
+  select(erocl) %>%
+  mutate(erocl_num = as.numeric(as.factor(erocl))) %>%
+  distinct() %>%
+  select(erocl_num,erocl) %>%
+  arrange(erocl_num) %>%
+  drop_na()
 
 erocl_spatrast<-classify(ssurgo_spatrastcp, erocl_table)
+
+names(erocl_spatrast) <- "erocl"
+
+levels(erocl_spatrast) <- erocl_label
 
 erocl_spatrast_path <- paste0("../data/raster/",substitute(erocl_spatrast),".tif")
 
 writeRaster(erocl_spatrast,erocl_spatrast_path, overwrite = T)
 
-erocl_spatrast<-rast("../data/raster/erocl_spatrast.tif")
-
-names(erocl_spatrast) <- "erocl"
-
 hydgrp_table <- component_tablef_mod %>%
   select(mukey,hydgrp) %>%
   mutate(hydgrp = as.numeric(as.factor(hydgrp)))
 
+hydgrp_label <- component_tablef_mod %>%
+  select(hydgrp) %>%
+  mutate(hydgrp_num = as.numeric(as.factor(hydgrp))) %>%
+  distinct() %>%
+  select(hydgrp_num,hydgrp) %>%
+  arrange(hydgrp_num) %>%
+  drop_na()
+
 hydgrp_spatrast<-classify(ssurgo_spatrastcp, hydgrp_table)
+
+names(hydgrp_spatrast) <- "hydgrp"
+
+levels(hydgrp_spatrast) <- hydgrp_label
 
 hydgrp_spatrast_path <- paste0("../data/raster/",substitute(hydgrp_spatrast),".tif")
 
 writeRaster(hydgrp_spatrast,hydgrp_spatrast_path, overwrite = T)
 
-hydgrp_spatrast<-rast("../data/raster/hydgrp_spatrast.tif")
-
-names(hydgrp_spatrast) <- "hydgrp"
-
 drainagecl_table <- component_tablef_mod %>%
   select(mukey,drainagecl) %>%
   mutate(drainagecl = as.numeric(as.factor(drainagecl)))
 
+drainagecl_label <- component_tablef_mod %>%
+  select(drainagecl) %>%
+  mutate(drainagecl_num = as.numeric(as.factor(drainagecl))) %>%
+  distinct() %>%
+  select(drainagecl_num,drainagecl) %>%
+  arrange(drainagecl_num) %>%
+  drop_na()
+
 drainagecl_spatrast<-classify(ssurgo_spatrastcp, drainagecl_table)
+
+names(drainagecl_spatrast) <- "drainagecl"
+
+levels(drainagecl_spatrast) <- drainagecl_label
 
 drainagecl_spatrast_path <- paste0("../data/raster/",substitute(drainagecl_spatrast),".tif")
 
 writeRaster(drainagecl_spatrast,drainagecl_spatrast_path, overwrite = T)
 
-drainagecl_spatrast<-rast("../data/raster/drainagecl_spatrast.tif")
-
-names(drainagecl_spatrast) <- "drainagecl"
-
 taxpartsize_table <- component_tablef_mod %>%
   select(mukey,taxpartsize) %>%
   mutate(taxpartsize = as.numeric(as.factor(taxpartsize)))
 
+taxpartsize_label <- component_tablef_mod %>%
+  select(taxpartsize) %>%
+  mutate(taxpartsize_num = as.numeric(as.factor(taxpartsize))) %>%
+  distinct() %>%
+  select(taxpartsize_num,taxpartsize) %>%
+  arrange(taxpartsize_num) %>%
+  drop_na()
+
 taxpartsize_spatrast<-classify(ssurgo_spatrastcp, taxpartsize_table)
+
+names(taxpartsize_spatrast) <- "taxpartsize"
+
+levels(taxpartsize_spatrast) <- taxpartsize_label
 
 taxpartsize_spatrast_path <- paste0("../data/raster/",substitute(taxpartsize_spatrast),".tif")
 
 writeRaster(taxpartsize_spatrast,taxpartsize_spatrast_path, overwrite = T)
-
-taxpartsize_spatrast<-rast("../data/raster/taxpartsize_spatrast.tif")
-
-names(taxpartsize_spatrast) <- "taxpartsize"
 
 soiltaxprop_spatrast<-c(order_spatrast,suborder_spatrast, greatgroup_spatrast, subgroup_spatrast, pH_spatrast, erocl_spatrast, hydgrp_spatrast, drainagecl_spatrast, taxpartsize_spatrast)
 
@@ -649,5 +1247,385 @@ soiltaxprop_spatrast_path <- paste0("../data/raster/",substitute(soiltaxprop_spa
 
 writeRaster(soiltaxprop_spatrast,soiltaxprop_spatrast_path, overwrite = T)
 
+soiltaxprop_spatrast <- rast("../data/raster/soiltaxprop_spatrast.tif")
+
+# model_sfpf<-final_sfpf %>%
+#   cbind(extract(soiltaxprop_spatrast, final_sfpf, bind = FALSE)[2:10]) %>%
+#   mutate(erocl = case_when(
+#   is.na(erocl) ~ "Other",
+#   TRUE ~ as.character(erocl)
+#   )) %>%
+#   select(soc_mgha, elevation, slope, southwestness, landcover, landcover_old, taxorder, taxsuborder_mod, taxgrtgroup_mod, taxsubgrp_mod, ph1to1h2o_r, erocl, hydgrp, drainagecl, taxpartsize, map, mat, southwestness,pedon_key) %>%
+#   mutate(across(where(is.character), as.factor)) %>%
+#   mutate(landcover = as.factor(landcover),
+#          landcover_old = as.factor(landcover_old)) %>%
+#   st_drop_geometry()
+
+model_sfpf<-all_sfpf %>%
+  cbind(extract(soiltaxprop_spatrast, all_sfpf, bind = FALSE)[2:10]) %>%
+  mutate(erocl = case_when(
+  is.na(erocl) ~ "Other",
+  TRUE ~ as.character(erocl)
+  )) %>%
+  select(soc_mgha, elevation, slope, southwestness, landcover, landcover_old, taxorder, taxsuborder_mod, taxgrtgroup_mod, taxsubgrp_mod, ph1to1h2o_r, erocl, hydgrp, drainagecl, taxpartsize, map, mat, southwestness,pedon_key) %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  mutate(landcover = as.factor(landcover),
+         landcover_old = as.factor(landcover_old)) %>%
+  st_drop_geometry()
+
+write.csv(model_sfpf, "../data/tabular/model_sfpf.csv", row.names = FALSE)
+```
+
+##create predictor stack
+
+```{r}
+climatep_spatrast <- resample(climate_spatrast, soiltaxprop_spatrast, method = "bilinear")
+
+topop_spatrast <- resample(topo_spatrast, soiltaxprop_spatrast, method = "bilinear")
+
+#nlcd2023p_spatrast <- resample(nlcd2023_spatrast, soiltaxprop_spatrast, method = "near")
+#
+# predictor_stack <- c(climatep_spatrast, topop_spatrast, nlcd2023p_spatrast, soiltaxprop_spatrast)
+# 
+# predictor_stack$nlcd_2013 <- as.factor(predictor_stack$nlcd_2013)
+# predictor_stack$nlcd_2023 <- as.factor(predictor_stack$nlcd_2023)
+
+predictor_stack_nolandcover <- c(climatep_spatrast, topop_spatrast, soiltaxprop_spatrast)
+
+writeRaster(predictor_stack_nolandcover, "../data/raster/predictor_stack_nolandcover.tif", overwrite = TRUE)
+
+predictor_stack_nolandcover <- rast("../data/raster/predictor_stack_nolandcover.tif")
+```
+
+##extract predictor values to points
+
+```{r}
+
+
+
+```
+
+# modeling
+
+##random Forest Model
+
+```{r}
+model_sfpf <- read.csv("../data/tabular/model_sfpf.csv")
+
+set.seed(737)
+
+data_split <- initial_split(model_sfpf, prop = 0.8, strata = soc_mgha)
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+rf_recipe <- recipe(soc_mgha ~ ., data = data_train) %>%
+  step_rm(pedon_key)
+
+rf_model <- rand_forest(
+  trees = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "permutation") %>%
+  set_mode("regression")
+
+rf_workflow <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(rf_recipe)
+
+rf_param <- parameters(rf_model) %>%
+  update(
+    trees = trees(c(200, 1000)),
+    min_n = min_n(c(2, 10))
+  )
+
+rf_vfold <- vfold_cv(data_train, v = 10, strata = soc_mgha)
+
+rf_bayes <- tune_bayes(
+  rf_workflow,
+  resamples = rf_vfold,
+  param_info = rf_param,
+  initial = 10,
+  iter = 100,
+  metrics = metric_set(rmse),
+  control = control_bayes(no_improve = 10, verbose = TRUE)
+)
+
+rf_metrics <- collect_metrics(rf_bayes)
+rf_best <- select_best(rf_bayes, metric = "rmse")
+
+rf_final_wf <- finalize_workflow(rf_workflow, rf_best)
+
+rf_fit <- rf_final_wf %>%
+  fit(data = data_train)
+
+rf_preds <- predict(rf_fit, data_test) %>%
+  bind_cols(data_test) %>%
+  mutate(error = abs(.pred - soc_mgha)) %>%
+  mutate(error_per = error / soc_mgha * 100)
+rf_results <- rf_preds %>%
+  metrics(truth = soc_mgha, estimate = .pred)
+
+ggplot() +
+  geom_point(rf_preds, mapping = aes(x = .pred, y = soc_mgha)) + 
+  geom_abline() +
+  scale_x_continuous(limits = c(0, 400)) +
+  scale_y_continuous(limits = c(0, 400))
+
+rf_fit_ranger <- extract_fit_parsnip(rf_fit)$fit
+var_imp <- as.data.frame(rf_fit_ranger$variable.importance)
+var_imp$variable <- rownames(var_imp)
+colnames(var_imp)[1] <- "importance"
+var_imp <- var_imp[order(var_imp$importance, decreasing = TRUE), ]
+
+ggplot(var_imp, aes(x = reorder(variable, importance), y = importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Variable Importance (Permutation)", x = "Variable", y = "Importance")
+
+rf_final_recipe <- recipe(soc_mgha ~ ., data = model_sfpf)
+rf_final_wf_all <- rf_final_wf %>%
+  update_recipe(rf_final_recipe)
+rf_fit_all <- rf_final_wf_all %>%
+  fit(data = model_sfpf)
+
+saveRDS(rf_fit_all, "../data/model/rf_fit.rds")
+```
+
+##validation uncertainty test
+
+```{r}
+# Load libraries
+library(tidymodels)
+library(tune)
+library(dplyr)
+library(ranger)
+
+model_sfpf <- read.csv("../data/tabular/model_sfpf.csv") %>%
+  mutate(soc_mgha = log(soc_mgha))
+
+# Set up the seed grid with extra columns for test set stats
+seed_grid <- data.frame(
+  seed = 1:1000,
+  rsq = NA_real_,
+  rmse = NA_real_,
+  test_mean = NA_real_,
+  test_median = NA_real_,
+  test_min = NA_real_,
+  test_max = NA_real_
+)
+
+# ---- 1. Tune ONCE on a single data split ----
+
+set.seed(123) # fixed seed for reproducible tuning
+data_split <- initial_split(model_sfpf, prop = 0.8, strata = soc_mgha)
+data_train <- training(data_split)
+data_test <- testing(data_split)
+
+rf_recipe <- recipe(soc_mgha ~ ., data = data_train) %>%
+  step_rm(pedon_key)
+
+rf_model <- rand_forest(
+  trees = tune(),
+  min_n = tune()
+) %>%
+  set_engine("ranger", importance = "permutation") %>%
+  set_mode("regression")
+
+rf_workflow <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(rf_recipe)
+
+rf_param <- parameters(rf_model) %>%
+  update(
+    trees = trees(c(200, 1000)),
+    min_n = min_n(c(2, 10))
+  )
+
+rf_vfold <- vfold_cv(data_train, v = 10, strata = soc_mgha)
+
+rf_bayes <- tune_bayes(
+  object = rf_workflow,
+  resamples = rf_vfold,
+  param_info = rf_param,
+  initial = 10,
+  iter = 100,
+  metrics = metric_set(rmse, rsq),
+  control = control_bayes(no_improve = 10, verbose = FALSE)
+)
+
+rf_best <- select_best(rf_bayes, metric = "rmse")
+
+# ---- 2. Use best parameters for all seeds ----
+
+rf_final_wf <- finalize_workflow(rf_workflow, rf_best)
+
+for (i in seq_len(nrow(seed_grid))) {
+  set.seed(i)
+  
+  data_split <- initial_split(model_sfpf, prop = 0.8, strata = soc_mgha)
+  data_train <- training(data_split)
+  data_test <- testing(data_split)
+  
+  rf_fit <- rf_final_wf %>%
+    fit(data = data_train)
+  
+  rf_preds <- predict(rf_fit, data_test) %>%
+    bind_cols(data_test)
+  
+  rf_results <- rf_preds %>%
+    metrics(truth = soc_mgha, estimate = .pred)
+  
+  seed_grid$rsq[i] <- rf_results$.estimate[rf_results$.metric == "rsq"]
+  seed_grid$rmse[i] <- rf_results$.estimate[rf_results$.metric == "rmse"]
+  
+  # Calculate test set stats and record
+  test_soc <- data_test$soc_mgha
+  test_pedons <- as.list(data_test$pedon_key)
+  seed_grid$test_pedons[[i]] <- test_pedons
+  seed_grid$test_mean[i] <- mean(test_soc, na.rm = TRUE)
+  seed_grid$test_median[i] <- median(test_soc, na.rm = TRUE)
+  seed_grid$test_min[i] <- min(test_soc, na.rm = TRUE)
+  seed_grid$test_max[i] <- max(test_soc, na.rm = TRUE)
+
+  # Calculate train set stats and record
+  train_soc <- data_train$soc_mgha
+  train_pedons <- as.list(data_train$pedon_key)
+  seed_grid$train_pedons[[i]] <- train_pedons
+  seed_grid$train_mean[i] <- mean(train_soc, na.rm = TRUE)
+  seed_grid$train_median[i] <- median(train_soc, na.rm = TRUE)
+  seed_grid$train_min[i] <- min(train_soc, na.rm = TRUE)
+  seed_grid$train_max[i] <- max(train_soc, na.rm = TRUE)
+}
+
+# Save results
+write.csv(seed_grid, "../data/model/validation_uncertainty.csv", row.names = FALSE)
+
+summary(seed_grid)
+
+hist(seed_grid$rsq, breaks = 30, main = "Distribution of R-squared", xlab = "R-squared")
+
+hist(seed_grid$rmse, breaks = 30, main = "Distribution of RMSE", xlab = "RMSE")
+
+ggplot(seed_grid, aes(x = rsq, y = rmse)) +
+  geom_point() +
+  labs(title = "R-squared vs RMSE", x = "R-squared", y = "RMSE") +
+  theme_minimal()
+
+ggplot(seed_grid, aes(x = test_max,y = rsq))+
+  geom_point() +
+  labs(title = "R-squared vs Test Max", x = "Test Max", y = "R-squared") +
+  theme_minimal()
+
+aggplot(seed_grid, aes(x = test_max,y = rmse))+
+  geom_point() +
+  labs(title = "RMSE vs Test Max", x = "Test Max", y = "RMSE") +
+  theme_minimal()
+
+seed_grid_poor <- seed_grid %>%
+  filter(rsq < 0.2 | rmse > .5) %>%
+  select(rsq, rmse, test_pedons) %>%
+  unnest(cols = test_pedons) %>%
+  group_by(test_pedons) %>%
+  summarise(count = n()) %>%
+  ungroup()
+```
+##factor analysis of mixed data (FAMD)
+
+```{r}
+install.packages("FactoMineR")
+install.packages("factoextra") # For visualization (optional)
+library(FactoMineR)
+library(factoextra)
+
+famd_data <- model_sfpf %>%
+  select(-pedon_key, -soc_mgha) %>%
+  mutate(across(where(is.character), as.factor))
+
+famd_result <- FAMD(famd_data, graph = FALSE)
+
+fviz_famd_var(famd_result, repel = TRUE)
+
+fviz_famd_ind(famd_result, repel = TRUE)
+```
+
+##dissimilarity Index
+
+### my own attempt at AOA
+
+```{r}
+block_size <- 10000 # adjust as needed
+n_pixels <- nrow(pixel_matrix)
+results_list <- list()
+
+for (start_idx in seq(1, n_pixels, by = block_size)) {
+  end_idx <- min(start_idx + block_size - 1, n_pixels)
+  block <- pixel_matrix[start_idx:end_idx, , drop = FALSE]
+  results_list[[length(results_list) + 1]] <- gower::gower_dist(block, train_df)
+}
+
+# Combine blocks into one matrix if needed
+gower_dist_matrix <- do.call(rbind, results_list)
+```
+
+
+### AOA
+```{r}
+model_sfpf <- read.csv("../data/tabular/model_sfpf.csv") %>%
+  select(-pedon_key)
+predictor_stack <- rast("../data/raster/predictor_stack.tif")
+predictor_names <- c("mat", "map", "elevation", "slope", "aspect","southwestness", 
+                     "landcover", "landcover_old", "taxorder", "taxsuborder_mod", 
+                     "taxgrtgroup_mod", "taxsubgrp_mod", "ph1to1h2o_r", 
+                     "erocl", "hydgrp", "drainagecl", "taxpartsize")
+names(predictor_stack) <- predictor_names
+predictor_stack_filter<-predictor_stack %>%
+  select(-aspect)
+variables <- names(predictor_stack_filter)
+model_sfpf_predictors <- read.csv("../data/tabular/model_sfpf.csv") %>%
+  select(-pedon_key, -soc_mgha) %>%
+  select(all_of(variables))
+
+  select(-aspect)
+
+
+
+for (i in seq_len(ncol(model_sfpf_predictors))) {
+  col_name <- colnames(model_sfpf_predictors)[i]
+  if (is.character(model_sfpf_predictors[[i]])) {
+    lookup <- predictor_levels[[i]]
+    model_sfpf_predictors[[i]] <- factor(
+      lookup$value[match(model_sfpf_predictors[[i]], lookup[[col_name]])]
+    )
+  }
+}
+
+set.seed(123)
+
+model <- train(
+  soc_mgha ~ .,
+  data = model_sfpf,
+  method = "rf",
+  trControl = trainControl(method = "cv", number = 10, verboseIter = TRUE),
+  tuneLength = 5,
+  importance=TRUE
+)
+
+saveRDS(model, "../data/model/soc_mgha_rf_caret_model.rds")
+
+model <- readRDS("../data/model/soc_mgha_rf_caret_model.rds")
+
+filename <- paste0("../data/raster/tile/", "coastalplainpred.tif")
+
+predictortile<-makeTiles(predictor_stack, 10000, filename)
+
+predictor_files <- list.files("../data/raster/tile/", pattern = "*.tif$",full.names = T)
+
+predictor_spatraster <- lapply(predictor_files,rast)
+
+plot(predictor_spatraster[[12]])
+
+traindi <- trainDI(model = model)
+
+predictor_aoa <- aoa(predictor_stack_filter,train = model_sfpf,variables = variables)
 
 ```
